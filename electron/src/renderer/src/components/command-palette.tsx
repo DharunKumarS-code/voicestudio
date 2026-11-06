@@ -9,6 +9,7 @@ import { useHistory } from '@/hooks/use-history';
 import { useProfiles } from '@/hooks/use-profiles';
 import { useGenerateClone } from '@/hooks/use-generate';
 import { setWorkspace } from '@/lib/store/workspace';
+import { openPdfReader } from '@/lib/pdf-reader';
 import { openTake } from '@/lib/store/takes';
 import { selectCloneProfile } from '@/lib/store/reference';
 import { patchCloneSettings } from '@/lib/store/clone-settings';
@@ -23,6 +24,7 @@ import { commandMatches, recentTakes, takeLength, type CommandItem } from './com
 import {
   AudioLinesIcon,
   BlocksIcon,
+  BookHeadphonesIcon,
   BookOpenIcon,
   BoxesIcon,
   CrownIcon,
@@ -197,12 +199,22 @@ export function CommandPalette() {
       run: () => navigate({ to: '/design' }),
     },
     {
+      // Restored alongside 'pdf-reader' below: separate features (new
+      // multi-voice Audiobook project vs. reading a PDF aloud in the browser).
       id: 'audiobook',
       label: t('audiobook.title'),
       keywords: ['audiobook', 'book', 'new project'],
       group: workspaceGroup,
       icon: BookOpenIcon,
       run: () => navigate({ to: '/audiobook' }),
+    },
+    {
+      id: 'pdf-reader',
+      label: t('pdfReader.title'),
+      keywords: ['pdf', 'reader', 'read aloud', 'audiobook', 'book'],
+      group: workspaceGroup,
+      icon: BookHeadphonesIcon,
+      run: () => void openPdfReader(),
     },
     {
       id: 'projects',

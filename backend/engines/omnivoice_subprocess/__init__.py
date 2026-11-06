@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING
 
 from services.expression import OMNIVOICE_INLINE_TAGS
 from services.subprocess_backend import SubprocessBackend
+from services.tts_backend import TTS_WARMUP_TEXT
 
 if TYPE_CHECKING:
     import torch  # noqa: F401
@@ -91,6 +92,21 @@ class OmniVoiceSubprocessBackend(SubprocessBackend):
                     os.remove(passage)
                 except OSError:
                     pass
+
+    def warmup(self) -> None:
+        """Same purpose as ``OmniVoiceBackend.warmup`` — pay the first-call
+        cold-start tax at startup instead of on a user's first real request —
+        but here it is the ONLY warm-up this engine gets: ``preload_model()``
+        only knows the in-process singleton and explicitly skips whenever
+        this subprocess-isolated id is the active engine (investigated for
+        the TTS Performance Investigation's Stage A: confirmed via this
+        installation's own prefs.json, ``"tts_backend":
+        "omnivoice-subprocess"``). ``generate()`` here spawns the sidecar
+        (idempotently — ``SubprocessBackend`` reuses an already-running one)
+        and runs the SAME model-loading + first-compile path inside it that a
+        real request would, so there is still exactly one resident sidecar,
+        never a duplicate."""
+        self.generate(TTS_WARMUP_TEXT)
 
     @classmethod
     def is_available(cls) -> tuple[bool, str]:

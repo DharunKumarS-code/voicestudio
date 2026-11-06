@@ -488,7 +488,21 @@ def test_failed_mux_removes_partial_output_and_keeps_resume(
             asyncio.run(asyncio.wait_for(render(), timeout=120))
     else:
         asyncio.run(asyncio.wait_for(render(), timeout=120))
-        assert events[-1]["type"] == "error", events
+        last = events[-1]
+        assert last["type"] == "error", events
+        # The real mux failure must reach the client/manifest, not the old
+        # "render failed (see backend log)" placeholder — build_failure_event's
+        # structured shape (reason/error/error_class/stage), same as every
+        # other terminal failure event in this function.
+        assert last["error"] != "render failed (see backend log)", events
+        assert last["reason"] == last["error"]
+        assert last["error_class"] == "RuntimeError"
+        assert last["stage"] == "audiobook_render"
+        expected_detail = {
+            "nonzero": "ffmpeg assembly failed (exit code 1)",
+            "exception": "mux interrupted after writing",
+        }[failure]
+        assert expected_detail in last["reason"], events
     assert len(attempted) == 1
     assert not attempted[0].exists(), "failed mux left an incomplete library output"
     assert not any(event["type"] == "done" for event in events)

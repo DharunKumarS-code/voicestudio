@@ -12,6 +12,8 @@ vi.mock('@tanstack/react-router', () => ({
 }));
 vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
 vi.mock('@/lib/store/workspace', () => ({ setWorkspace: vi.fn() }));
+const reader = vi.hoisted(() => ({ open: vi.fn(async () => ({ ok: true })) }));
+vi.mock('@/lib/pdf-reader', () => ({ openPdfReader: reader.open }));
 import { WorkspaceNavigation } from './workspace-menu';
 
 it('opens the current workflow, lets users collapse it, and follows route changes', () => {
@@ -25,16 +27,40 @@ it('opens the current workflow, lets users collapse it, and follows route change
   );
   fireEvent.click(voice);
   expect(voice).toHaveAttribute('aria-expanded', 'false');
-  route.pathname = '/audiobook';
+  route.pathname = '/stories';
   rerender(<WorkspaceNavigation />);
   expect(screen.getByRole('button', { name: 'nav.stories' })).toHaveAttribute(
     'aria-expanded',
     'true',
   );
+  expect(screen.getByRole('link', { name: 'nav.stories' })).toHaveAttribute('href', '/stories');
+});
+
+it('keeps New Audiobook alongside the PDF Voice Reader launcher', () => {
+  route.pathname = '/stories';
+  render(<WorkspaceNavigation />);
+  // New Audiobook creation is a real navigation destination again…
   expect(screen.getByRole('link', { name: 'audiobook.title' })).toHaveAttribute(
     'href',
     '/audiobook',
   );
+  // …alongside the PDF Voice Reader launcher, which opens the browser instead
+  // of routing.
+  const launch = screen.getByRole('button', { name: 'pdfReader.title' });
+  expect(launch.closest('a')).toBeNull();
+  reader.open.mockClear();
+  fireEvent.click(launch);
+  expect(reader.open).toHaveBeenCalledTimes(1);
+});
+
+it('offers the PDF Voice Reader from the compact rail flyout', async () => {
+  route.pathname = '/gallery';
+  render(<WorkspaceNavigation compact />);
+  fireEvent.click(screen.getByRole('button', { name: 'nav.stories' }));
+  const launch = await screen.findByRole('button', { name: 'pdfReader.title' });
+  reader.open.mockClear();
+  fireEvent.click(launch);
+  expect(reader.open).toHaveBeenCalledTimes(1);
 });
 
 it('keeps grouped destinations reachable from the compact rail', async () => {

@@ -89,7 +89,7 @@ def _current_platform_tags() -> list[str]:
     ``rocm`` (AMD HIP builds), and ``cpu`` (no GPU acceleration at all —
     Apple Silicon is NOT tagged cpu; it curates via ``darwin-arm64``).
     """
-    tags = [sys.platform]
+    tags: list[str] = [sys.platform]
     arch = _platform.machine()
     tags.append(f"{sys.platform}-{arch}")
     has_gpu = False

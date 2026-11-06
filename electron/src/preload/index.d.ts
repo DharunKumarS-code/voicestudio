@@ -18,6 +18,31 @@ export type BackendStage =
   | 'port_in_use' // backend exited 78 (EX_CONFIG): another process holds the port
   | 'failed'; // could not start within the budget / spawn error
 
+/** Why the PDF Voice Reader could not be opened (see main/reader-launcher.ts). */
+export type ReaderFailure =
+  | 'remote'
+  | 'setup_required'
+  | 'port_in_use'
+  | 'start_failed'
+  | 'timeout'
+  | 'reader_missing'
+  | 'browser_failed';
+
+export type ReaderOpenResult =
+  | { ok: true; url: string; startedBackend: boolean }
+  | {
+      ok: false;
+      reason: ReaderFailure;
+      /** English summary for logs; the renderer shows a translated text built from `reason`. */
+      message: string;
+      /** The reader URL, when known (lets the user open it by hand). */
+      url?: string;
+      /** The backend port involved in a port conflict. */
+      port?: number;
+      /** Technical detail from the backend supervisor or the failing call (untranslated). */
+      detail?: string;
+    };
+
 export interface NativeCrashRecord {
   timestamp: number;
   version: string;
@@ -435,6 +460,10 @@ export interface VoiceStudioBridge {
     useRemote(input: { url: string; apiKey: string }): Promise<RemoteBackendProbe>;
     useLocal(): Promise<BackendConnection>;
     websocketUrl(path: '/ws/transcribe' | '/ws/events' | '/ws/tts'): Promise<string>;
+  };
+  /** PDF Voice Reader: ensure the local backend is up, then open /reader/ in the default browser. */
+  reader: {
+    open(): Promise<ReaderOpenResult>;
   };
   capture: {
     phase(

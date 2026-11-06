@@ -624,6 +624,17 @@
       ],
       "title": "Seed"
      },
+     "source_project_id": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Source Project Id"
+     },
      "text": {
       "title": "Text",
       "type": "string"
@@ -717,6 +728,30 @@
      "file"
     ],
     "title": "Body_audiobook_import_audiobook_import_post",
+    "type": "object"
+   },
+   "Body_audiobook_pdf_batches_audiobook_pdf_batches_post": {
+    "properties": {
+     "batch_size_pages": {
+      "default": 0,
+      "title": "Batch Size Pages",
+      "type": "integer"
+     },
+     "file": {
+      "contentMediaType": "application/octet-stream",
+      "title": "File",
+      "type": "string"
+     },
+     "options": {
+      "default": "{}",
+      "title": "Options",
+      "type": "string"
+     }
+    },
+    "required": [
+     "file"
+    ],
+    "title": "Body_audiobook_pdf_batches_audiobook_pdf_batches_post",
     "type": "object"
    },
    "Body_clean_audio_clean_audio_post": {
@@ -2251,6 +2286,79 @@
      "text"
     ],
     "title": "DubSegment",
+    "type": "object"
+   },
+   "EbookTranslateRequest": {
+    "description": "POST /audiobook/translate \u2014 chapter-by-chapter book translation.\n\n``text`` is the same chapter-delimited script ``AudiobookPlanRequest`` /\n``AudiobookRequest`` already accept (``# H1`` headings, inline\n``[voice:NAME]``/``[pause ...]``) \u2014 translating a book starts from the\nidentical plan Audiobook would synthesize from, so the two features never\ndisagree about what a \"chapter\" is. ``project_id`` must name an existing\n``studio_projects`` row: translation progress persists there (original and\ntranslated text, per chapter, independently), so the same request re-POSTed\nafter a crash/restart or a partial failure only (re)translates chapters that\naren't already done \u2014 see services.ebook_translate and the route docstring.",
+    "properties": {
+     "glossary": {
+      "anyOf": [
+       {
+        "items": {
+         "additionalProperties": true,
+         "type": "object"
+        },
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Glossary"
+     },
+     "project_id": {
+      "title": "Project Id",
+      "type": "string"
+     },
+     "provider": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Provider"
+     },
+     "source_lang": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Source Lang"
+     },
+     "target_lang": {
+      "title": "Target Lang",
+      "type": "string"
+     },
+     "text": {
+      "title": "Text",
+      "type": "string"
+     },
+     "translation_instructions": {
+      "anyOf": [
+       {
+        "maxLength": 5000,
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Translation Instructions"
+     }
+    },
+    "required": [
+     "project_id",
+     "text",
+     "target_lang"
+    ],
+    "title": "EbookTranslateRequest",
     "type": "object"
    },
    "EffectPresetEntry": {
@@ -9054,6 +9162,102 @@
     "summary": "List Resumable Jobs"
    }
   },
+  "/audiobook/pdf-batches": {
+   "post": {
+    "description": "Split a PDF into page-aligned batches and render each one, in order,\nas its own independent audiobook (own output file, own cache, own\nresumability) \u2014 for books too large to comfortably render as one job.\nStreams the same chapter-level SSE events /audiobook does, interleaved\nwith batch-level ``batch_*`` events reporting total/current/completed/\nfailed batches.",
+    "operationId": "audiobook_pdf_batches_audiobook_pdf_batches_post",
+    "requestBody": {
+     "content": {
+      "multipart/form-data": {
+       "schema": {
+        "$ref": "#/components/schemas/Body_audiobook_pdf_batches_audiobook_pdf_batches_post"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Audiobook Pdf Batches"
+   }
+  },
+  "/audiobook/pdf-batches/jobs": {
+   "get": {
+    "description": "List interrupted PDF-batch audiobook jobs that can be resumed \u2014 a\nwork dir that still holds a resume manifest. Mirrors ``GET\n/audiobook/jobs``'s shape for the single-script resume list.",
+    "operationId": "list_resumable_pdf_batch_jobs_audiobook_pdf_batches_jobs_get",
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "additionalProperties": true,
+         "title": "Response List Resumable Pdf Batch Jobs Audiobook Pdf Batches Jobs Get",
+         "type": "object"
+        }
+       }
+      },
+      "description": "Successful Response"
+     }
+    },
+    "summary": "List Resumable Pdf Batch Jobs"
+   }
+  },
+  "/audiobook/pdf-batches/resume/{job_id}": {
+   "post": {
+    "description": "Resume an interrupted PDF-batch job from its persisted manifest.\n\nEvery batch already verified complete (file exists, ffprobe-decodable)\nis preserved untouched; the batch that was mid-render when the process\ndied, any previously-failed batch, and any batch whose output is\nmissing/corrupt are all retried \u2014 reusing each one's original child job\nid, which transparently gets Stage 1/2's existing per-chapter cache for\nfree. Streams the same ``batch_*``/chapter-level SSE events the create\nendpoint does, plus one ``recovery_summary`` event up front reporting\nwhat was verified vs. reset.\n\nFound via the same trusted-filesystem-enumeration pattern\n:func:`resume_longform` uses for single-script jobs \u2014 the ``job_id``\npath param only *selects* an entry from that trusted list, never builds\na path directly (CodeQL py/path-injection-safe).",
+    "operationId": "resume_pdf_batches_audiobook_pdf_batches_resume__job_id__post",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "job_id",
+      "required": true,
+      "schema": {
+       "title": "Job Id",
+       "type": "string"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Resume Pdf Batches"
+   }
+  },
   "/audiobook/plan": {
    "post": {
     "description": "Parse a script into a chapter/span plan (pure preview, no synthesis).",
@@ -9172,6 +9376,85 @@
      }
     },
     "summary": "Resume Longform"
+   }
+  },
+  "/audiobook/translate": {
+   "post": {
+    "description": "Translate a chapter-delimited script chapter-by-chapter, streaming SSE\nprogress. Progress for ``req.project_id`` persists durably \u2014 see the\nmodule section docstring above and ``GET /audiobook/translate/{project_id}``\nto read it back without starting a new run.",
+    "operationId": "audiobook_translate_audiobook_translate_post",
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/EbookTranslateRequest"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Audiobook Translate"
+   }
+  },
+  "/audiobook/translate/{project_id}": {
+   "get": {
+    "description": "Read back a project's persisted translation progress \u2014 recovery after\na backend restart or reopening the app, and the status a caller must\ncheck (``complete``) before treating the translated text as safe to use\nfor anything downstream (e.g. generating an audiobook from it). 404 only\nwhen the project itself doesn't exist; a project with no translation run\nyet returns a zero-chapter, not-complete state rather than 404.",
+    "operationId": "get_translate_status_audiobook_translate__project_id__get",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "project_id",
+      "required": true,
+      "schema": {
+       "title": "Project Id",
+       "type": "string"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "additionalProperties": true,
+         "title": "Response Get Translate Status Audiobook Translate  Project Id  Get",
+         "type": "object"
+        }
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Get Translate Status"
    }
   },
   "/batch/download/{job_id}/{lang}": {

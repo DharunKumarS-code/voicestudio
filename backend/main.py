@@ -473,6 +473,18 @@ def _watermark_preload_delay_s() -> float:
     return _env_float("OMNIVOICE_PRELOAD_WATERMARK_DELAY", 35.0)
 
 
+def _tts_warmup_delay_s() -> float:
+    """Seconds after boot before the configured TTS engine's dummy warm-up
+    synthesis fires (TTS Performance Investigation, Stage A).
+
+    Own knob, distinct from the other preload delays above: this is the
+    highest-value warm-up (synthesis was measured as the dominant share of a
+    cold render — ~260s of a 352s total on this host), so it fires first,
+    before capture-ASR (30s) and watermark (35s) claim the GPU. Overridable
+    via OMNIVOICE_PRELOAD_TTS_WARMUP_DELAY."""
+    return _env_float("OMNIVOICE_PRELOAD_TTS_WARMUP_DELAY", 3.0)
+
+
 def _capture_preload_ram_ok(min_free_bytes: int = 4 * 1024**3) -> bool:
     """RAM guard for the dictation warm-up: skip below 4 GB free so the
     background load never pushes a small machine into swap. If free memory
@@ -862,6 +874,13 @@ def _phase_a_finalize() -> None:
     if os.path.isdir(_demo_dir):
         app.mount("/demo_audio", StaticFiles(directory=_demo_dir), name="demo_audio")
 
+    # Live PDF reader (backend/reader/): a standalone page served from the
+    # backend's own origin, so its /ws/tts socket and /profiles fetch pass the
+    # same-origin checks with no CORS setup. Open http://127.0.0.1:3900/reader/
+    _reader_dir = os.path.join(os.path.dirname(__file__), "reader")
+    if os.path.isdir(_reader_dir):
+        app.mount("/reader", StaticFiles(directory=_reader_dir, html=True), name="reader")
+
     # SPA shell LAST so the "/" StaticFiles mount can't shadow any router.
     from core.spa_inject import (
         dev_ui_redirect,
@@ -1210,6 +1229,66 @@ async def _phase_b(app: FastAPI) -> None:
 
         app.state.watermark_preload_task = asyncio.create_task(_preload_watermark())
 
+    # TTS Performance Investigation, Stage A: preload_model() above only
+    # loads weights — it never calls generate() — so on CUDA the model's
+    # first torch.compile/CUDA-graph-capture pass still lands on whichever
+    # request happens to be first. Worse, preload_model() is also scoped to
+    # the in-process "omnivoice" singleton only, so it unconditionally skips
+    # whenever a subprocess-isolated variant (e.g. "omnivoice-subprocess") is
+    # the configured engine — confirmed via this project's own installation,
+    # whose prefs.json has "tts_backend": "omnivoice-subprocess", for which
+    # NOTHING warmed the engine before this change. Calling
+    # get_active_tts_backend().warmup() instead of reaching for either engine
+    # directly means this covers whichever of the two is actually configured,
+    # through the exact same instance-cache / licence / VRAM-eviction /
+    # idle-unload path a real request already uses — see
+    # services.tts_backend.OmniVoiceBackend.warmup and
+    # engines.omnivoice_subprocess.OmniVoiceSubprocessBackend.warmup.
+    if _env_flag("OMNIVOICE_PRELOAD_TTS_WARMUP", default=True):
+        async def _warmup_tts_engine():
+            await asyncio.sleep(_tts_warmup_delay_s())
+            await _await_profile_reconcile(app)
+            try:
+                from services.performance_profiles import TIERED_TTS_ENGINES
+                from services.tts_backend import active_backend_id
+
+                bid = active_backend_id()
+                if bid not in TIERED_TTS_ENGINES:
+                    logger.debug(
+                        "TTS warm-up skipped: %s is not a tiered OmniVoice engine.", bid)
+                    return
+
+                # Cache-only, same contract as preload_model(): warm an
+                # already-installed checkpoint, never trigger a download.
+                from services.model_manager import (
+                    _checkpoint_in_local_cache,
+                    _gpu_pool,
+                    resolve_omnivoice_checkpoint,
+                )
+                checkpoint = resolve_omnivoice_checkpoint()
+                if not _checkpoint_in_local_cache(checkpoint):
+                    logger.info(
+                        "TTS warm-up skipped: %s is not installed locally.", checkpoint)
+                    return
+
+                from services.tts_backend import get_active_tts_backend
+                backend = get_active_tts_backend()
+                warmup = getattr(backend, "warmup", None)
+                if not callable(warmup):
+                    return
+
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(_gpu_pool, warmup)
+                logger.info("TTS engine %s warmed up.", bid)
+            except Exception as e:
+                # Licence not accepted, engine unavailable, generate() itself
+                # failing — none of these should be fatal for a background,
+                # best-effort warm-up; the engine still loads lazily on the
+                # first real request exactly as it did before this change.
+                logger.warning("TTS engine warm-up skipped: %s", e)
+
+        app.state.tts_warmup_task = asyncio.create_task(_warmup_tts_engine())
+
     # ── MCP session manager (Wave 2.2) ────────────────────────────────────
     # Run it in its OWN task owning the full enter→exit lifecycle (anyio
     # task-affinity, see _serve_mcp); only wait, with a timeout, for ready —
@@ -1412,6 +1491,7 @@ async def lifespan(app: FastAPI):
         getattr(app.state, "preload_task", None),
         getattr(app.state, "capture_preload_task", None),
         getattr(app.state, "watermark_preload_task", None),
+        getattr(app.state, "tts_warmup_task", None),
         timeout=20.0,
     )
     # The watermark warm-up runs on its dedicated 1-worker pool. Cancellation
@@ -2035,6 +2115,10 @@ app.add_middleware(BackendMarkerMiddleware)
 import mimetypes as _mimetypes
 _mimetypes.add_type("audio/wav",  ".wav")
 _mimetypes.add_type("audio/flac", ".flac")
+# Windows can map .js/.css to text/plain via the registry; the reader page
+# (backend/reader/) needs the real types or the browser refuses its scripts.
+_mimetypes.add_type("text/javascript", ".js")
+_mimetypes.add_type("text/css", ".css")
 
 # ── Health check ────────────────────────────────────────────────────────
 # Used by Docker health checks, load balancers, and the Electron desktop shell.

@@ -112,6 +112,9 @@ const bridge: VoiceStudioBridge = {
     useLocal: () => ipcRenderer.invoke('backend:useLocal'),
     websocketUrl: (path) => ipcRenderer.invoke('backend:websocketUrl', path),
   },
+  reader: {
+    open: () => ipcRenderer.invoke('reader:open'),
+  },
   maintenance: {
     scanReset: () => ipcRenderer.invoke('maintenance:scanReset'),
     purgeReset: (scopes) => ipcRenderer.invoke('maintenance:purgeReset', scopes),

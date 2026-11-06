@@ -59,6 +59,58 @@ def _missing_module_is_omnivoice(exc: ModuleNotFoundError) -> bool:
     return name == "omnivoice" or name.startswith("omnivoice.")
 
 
+#: How often a first import that lost a race with another thread is retried.
+_IMPORT_RACE_RETRIES = 3
+_IMPORT_RACE_BACKOFF_S = 0.5
+
+
+def _is_concurrent_import_race(exc: ImportError) -> bool:
+    """A transient ImportError from two threads importing a package at once.
+
+    When another thread is still executing a module's first import (e.g.
+    transformers' lazily-loaded submodules, which several startup tasks touch),
+    Python can hand this thread the half-initialised module, and ``from x import
+    Name`` fails with "cannot import name" / "partially initialized module".
+    A moment later the same import succeeds. A *missing* module
+    (ModuleNotFoundError) is never a race and is not matched here.
+    """
+    if isinstance(exc, ModuleNotFoundError):
+        return False
+    text = str(exc)
+    return "partially initialized module" in text or "cannot import name" in text
+
+
+def _import_with_race_retry(importer, *, retries: int = _IMPORT_RACE_RETRIES,
+                            sleep=time.sleep):
+    """Run ``importer()``, retrying only the concurrent-first-import race.
+
+    Seen live: the reader's first request ~1 s after startup imported
+    omnivoice while a startup task was importing transformers; the request
+    failed with "cannot import name 'AutoFeatureExtractor'" while the same
+    import succeeded 300 ms later. Any other ImportError is raised at once,
+    unchanged, so real environment breakage keeps its own diagnosis.
+    """
+    for attempt in range(retries + 1):
+        try:
+            return importer()
+        except ImportError as exc:
+            if attempt >= retries or not _is_concurrent_import_race(exc):
+                raise
+            logger.warning(
+                "Import raced another thread (%s); retrying (%d/%d).",
+                exc, attempt + 1, retries,
+            )
+            sleep(_IMPORT_RACE_BACKOFF_S * (attempt + 1))
+
+
+def _import_omnivoice_class():
+    # The class is OmniVoice — a library identifier, not product branding.
+    # The VoiceStudio rename must not touch it (checkpoint configs reference
+    # the class name via transformers architectures).
+    from omnivoice.models.omnivoice import OmniVoice as _OV
+    return _OV
+
+
 def _lazy_omnivoice():
     global _OmniVoice
     if _OmniVoice is None:
@@ -66,10 +118,7 @@ def _lazy_omnivoice():
 
         prepare_audio_imports()
         try:
-            # The class is OmniVoice — a library identifier, not product
-            # branding. The VoiceStudio rename must not touch it (checkpoint
-            # configs reference the class name via transformers architectures).
-            from omnivoice.models.omnivoice import OmniVoice as _OV
+            _OV = _import_with_race_retry(_import_omnivoice_class)
         except ModuleNotFoundError as exc:
             if not _missing_module_is_omnivoice(exc):
                 # Something in omnivoice's OWN import chain is missing — not

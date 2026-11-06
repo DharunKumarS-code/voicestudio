@@ -22,6 +22,7 @@ epub/pdf ingest, ACX mastering shipped; the resume UI surface remains a follow-u
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -36,11 +37,13 @@ from core import voice_leases
 from services.reference_transcript import stored_reference_transcript
 from core.render_trace import call as trace_call, stage as trace_stage
 
-from fastapi import APIRouter, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from schemas.requests import EbookTranslateRequest
+from services import ebook_translate
 from services.audiobook import (
     ExpressiveOptions,
     parse_audiobook_script,
@@ -252,6 +255,12 @@ class AudiobookRequest(ExpressiveMixin):
     # Optional cast map {[voice:NAME] → profile id} for multi-voice books (#1217).
     # Absent/empty reproduces today's exact render + cache keys.
     voice_map: dict[str, str] | None = None
+    # Optional link to a studio_projects row whose Ebook Translator progress
+    # (see GET /audiobook/translate/{project_id}) `req.text` was built from.
+    # None (the default, and every caller before this field existed) skips
+    # the completeness check below entirely — synthesizing from arbitrary
+    # text never required any translation metadata and still doesn't.
+    source_project_id: str | None = None
 
 
 def _resolve_voice(profile_id: str | None) -> dict:
@@ -1489,13 +1498,18 @@ async def _render_longform_sse(
         raise
     except Exception as e:  # surface, don't 500 the stream
         logger.exception("[%s] longform render failed", job_id)
+        # Carry the real reason (#1321's fix, extended here) instead of a bare
+        # "see backend log" placeholder — build_failure_event sanitizes paths/
+        # tokens the same way the per-chapter and all-chapters-failed events
+        # already do, so this is safe to send to the client and to persist in
+        # the PDF-batch resume manifest (queue.mark_failed stores it verbatim).
+        ev = build_failure_event(e, stage="audiobook_render")
         if job_store is not None:
             try:
-                job_store.mark_failed(job_id, str(e))
+                job_store.mark_failed(job_id, ev["reason"])
             except Exception:
                 pass  # best-effort job history
-        # Generic message only — don't leak the stack/exception text to the client.
-        yield _emit({"type": "error", "error": "render failed (see backend log)"})
+        yield _emit(ev)
     finally:
         voice_lease.release()
         try:
@@ -1543,6 +1557,12 @@ def _longform_response(stream) -> StreamingResponse:
 @router.post("/audiobook")
 async def audiobook_synthesize(req: AudiobookRequest, request: Request = None):
     """Synthesize a chapterized audiobook from a script, streaming SSE progress."""
+    # First statement, deliberately before engine-licence/plan-parsing/any
+    # synthesis-related work: a no-op for every caller that doesn't set
+    # source_project_id (unchanged default behavior), and a hard stop before
+    # anything else runs when it IS set and the linked translation isn't
+    # complete yet (see _require_translation_complete's docstring).
+    _require_translation_complete(req.source_project_id)
     _ensure_active_engine_licence()
     plan = parse_audiobook_script(req.text, default_voice=req.default_voice)
     # `request` is injected by FastAPI on the HTTP path (the default only applies
@@ -1555,6 +1575,466 @@ async def audiobook_synthesize(req: AudiobookRequest, request: Request = None):
             loudness=req.loudness, cover_path=req.cover_path, metadata=req.metadata,
             lexicon=req.lexicon, opts=_expressive_opts(req), voice_map=req.voice_map,
             job_type="audiobook",
+            is_disconnected=request.is_disconnected if request is not None else None,
+        ),
+    )
+
+
+# ── PDF batch audiobook: large-PDF import split into page-aligned batches,
+# processed one at a time (Stage 2 of the batch PDF-to-audiobook work; Stage 1
+# is services.pdf_batch_splitter.split_pdf_into_batches, additive and unwired
+# until here). Each batch is rendered as an ordinary, independent "audiobook"
+# job — its own job_id, its own content-addressed chapter cache (resume), its
+# own watermarking, its own output file — by calling _render_longform_sse once
+# per batch, in order, awaiting each one to completion before starting the
+# next. That reuse is what keeps GPU concurrency at 1 (chapters already run
+# through gpu_gateway one at a time; batches now do too, by construction, not
+# by a second lock) and is why a failed batch can't corrupt a completed one:
+# different job_id, different work dir, different output path.
+#
+# services.pdf_batch_queue.BatchQueue is the ordering/one-at-a-time/no-
+# duplicate-dispatch guard, kept as a pure, unit-tested module (no PDF, no
+# TTS) the same way services.longform_progress is for book-level progress.
+
+class PdfBatchAudiobookRequest(ExpressiveMixin):
+    """Render options for /audiobook/pdf-batches — the same knobs as
+    AudiobookRequest, minus ``text`` (the PDF upload supplies it) and
+    ``source_project_id`` (an Ebook-Translator link that doesn't apply to a
+    freshly-split PDF)."""
+
+    default_voice: str | None = None
+    language: str | None = None
+    bitrate: str = "128k"
+    format: str = "m4b"
+    loudness: str | None = None
+    cover_path: str | None = None
+    metadata: dict | None = None
+    lexicon: dict | None = None
+    voice_map: dict[str, str] | None = None
+
+
+#: In-process guard against two concurrent renders of the same PDF-batch
+#: job (Stage 3 fix). BatchQueue.next_pending()'s "only one running item"
+#: guard only protects within a single BatchQueue object; it does nothing
+#: across two separate requests, each of which builds its own BatchQueue
+#: from the same persisted manifest. Reusing the same job_id across resume
+#: calls (see _render_pdf_batches_sse's resume branch) means two concurrent
+#: resumes of the same interrupted job would otherwise both claim and render
+#: the same batch — confirmed by driving two concurrent resumes against the
+#: same manifest in the Stage 3 review: both independently rendered the same
+#: batch index, and one run's ffmpeg mux failed outright. A plain in-process
+#: set is sufficient here — this backend is single-process, and GPU
+#: concurrency is already capped at 1 worker independently of this guard.
+_pdf_batch_jobs_in_flight: set[str] = set()
+
+
+async def _render_pdf_batches_sse(
+    data: bytes | None,
+    *,
+    default_voice: str | None,
+    language: str | None = None,
+    fmt: str = "m4b",
+    bitrate: str = "128k",
+    loudness: str | None = None,
+    cover_path: str | None = None,
+    metadata: dict | None = None,
+    lexicon: dict | None = None,
+    opts: ExpressiveOptions | None = None,
+    voice_map: dict | None = None,
+    batch_size_pages: int,
+    job_id: str | None = None,
+    source_filename: str = "",
+    resume: bool = False,
+    is_disconnected: Callable[[], Awaitable[bool]] | None = None,
+):
+    """Split ``data`` into page-aligned batches and render them one at a time,
+    each through the shared chapterized renderer, streaming batch-level SSE
+    progress alongside the usual chapter-level events (tagged with
+    ``batch_index``/``total_batches`` so a client can show either or both).
+
+    Every batch-queue transition is persisted to a durable resume manifest
+    (:mod:`services.pdf_batch_resume`) — a crash mid-render leaves exactly
+    enough state for :func:`_resume_pdf_batches_sse` to reconstruct the
+    queue, re-verify every "done" batch's output file, and continue only the
+    batches that still need it (Stage 3). ``core.job_store``'s ``jobs`` row
+    stays the UI-history convenience it already was in Stage 2 — unchanged.
+
+    ``resume=True`` ignores every render-option kwarg above and reloads them
+    from the persisted manifest instead (``job_id`` must name an existing
+    resumable job — the caller is expected to have already resolved it via
+    :func:`services.pdf_batch_resume.scan_resumable`, the same trusted-
+    enumeration pattern :func:`resume_longform` uses).
+
+    ``job_id`` is registered in :data:`_pdf_batch_jobs_in_flight` for the
+    entire duration of the call (fresh create and resume alike) and always
+    released in a ``finally`` — including on failure, an unhandled
+    exception, or the client disconnecting (``GeneratorExit`` from
+    ``aclose()``), so a second call for the same job_id is rejected rather
+    than racing the first."""
+    import time as _time
+
+    from core.config import OUTPUTS_DIR
+    from services import pdf_batch_recovery, pdf_batch_resume
+    from services.pdf_batch_queue import BatchQueue
+    from services.pdf_batch_splitter import split_pdf_into_batches
+
+    if resume:
+        job_id = re.sub(r"[^A-Za-z0-9_-]", "", job_id or "")[:48]
+    else:
+        job_id = re.sub(r"[^A-Za-z0-9_-]", "", job_id or "")[:48] or uuid.uuid4().hex[:16]
+
+    if job_id in _pdf_batch_jobs_in_flight:
+        yield (f"data: {json.dumps({'type': 'error', 'error': f'batch job {job_id} is already being processed'})}\n\n")
+        return
+    _pdf_batch_jobs_in_flight.add(job_id)
+    try:
+        recovery_report: dict | None = None
+        if resume:
+            manifest = pdf_batch_resume.read_manifest(job_id) if job_id else None
+            if manifest is None:
+                yield (f"data: {json.dumps({'type': 'error', 'error': 'no resumable state for that job'})}\n\n")
+                return
+            source_data = pdf_batch_resume.read_source_pdf(job_id)
+            if source_data is None:
+                yield (f"data: {json.dumps({'type': 'error', 'error': 'the original PDF is no longer available'})}\n\n")
+                return
+            data = source_data
+            batch_size_pages = manifest.get("batch_size_pages", batch_size_pages) or batch_size_pages
+            source_filename = manifest.get("source_filename", "")
+            p = manifest.get("params", {})
+            default_voice = p.get("default_voice")
+            language = p.get("language")
+            fmt = p.get("fmt", "m4b")
+            bitrate = p.get("bitrate", "128k")
+            loudness = p.get("loudness")
+            cover_path = p.get("cover_path")
+            metadata = p.get("metadata")
+            lexicon = p.get("lexicon")
+            opts = ExpressiveOptions.from_manifest(p.get("expressive"))
+            voice_map = p.get("voice_map")
+            persisted_batches = manifest.get("batches")
+        else:
+            persisted_batches = None
+
+        try:
+            from core import job_store
+            if resume:
+                job_store.mark_running(job_id)
+            else:
+                job_store.create(job_id, type="audiobook_batch")
+                job_store.mark_running(job_id)
+        except Exception:
+            job_store = None  # job history is best-effort; never block the render
+
+        def _emit(payload: dict, *, persist: bool = True) -> str:
+            if persist and job_store is not None:
+                try:
+                    job_store.append_event(job_id, json.dumps(payload))
+                except Exception:
+                    pass  # best-effort job history; never block the stream
+            return f"data: {json.dumps(payload)}\n\n"
+
+        try:
+            batches = split_pdf_into_batches(data, batch_size_pages=batch_size_pages)
+        except ValueError as e:
+            if job_store is not None:
+                try:
+                    job_store.mark_failed(job_id, str(e))
+                except Exception:
+                    pass
+            yield _emit({"type": "error", "error": str(e)})
+            return
+
+        queue = BatchQueue.from_batches_and_state(batches, persisted_batches)
+        if resume:
+            recovery_started = _time.monotonic()
+            recovery_report = await pdf_batch_recovery.reconcile_queue_for_resume(
+                queue, outputs_dir=OUTPUTS_DIR)
+            recovery_report["recovery_ms"] = round((_time.monotonic() - recovery_started) * 1000, 1)
+
+        page_count = batches[-1].end_page if batches else 0
+        title = (metadata or {}).get("title") or source_filename
+
+        def _persist_manifest() -> None:
+            pdf_batch_resume.write_manifest(pdf_batch_resume.build_manifest(
+                job_id=job_id, title=title, source_filename=source_filename,
+                page_count=page_count, batch_size_pages=batch_size_pages,
+                params={
+                    "default_voice": default_voice, "language": language, "fmt": fmt,
+                    "bitrate": bitrate, "loudness": loudness, "cover_path": cover_path,
+                    "metadata": metadata, "lexicon": lexicon,
+                    "expressive": (opts or ExpressiveOptions()).to_manifest(),
+                    "voice_map": voice_map,
+                },
+                batches=queue.to_item_dicts(),
+            ))
+
+        if not resume:
+            pdf_batch_resume.write_source_pdf(job_id, data)
+        _persist_manifest()
+
+        yield _emit({"type": "batch_started", "job_id": job_id,
+                     **queue.snapshot(), "restored_outputs": queue.restored_outputs()})
+        if recovery_report is not None:
+            yield _emit({"type": "recovery_summary", **recovery_report})
+
+        while True:
+            if is_disconnected is not None:
+                try:
+                    gone = await is_disconnected()
+                except Exception:
+                    gone = False
+                if gone:
+                    queue.mark_stopped()
+                    break
+            item = queue.next_pending()
+            if item is None:
+                break
+            # Reuse a persisted child job id when one exists (a batch that was
+            # reset to pending by from_batches_and_state/reconcile still carries
+            # its original child_job_id) — this is what gets the interrupted
+            # batch Stage 1/2's existing chapter-level cache/resume for free,
+            # without any new per-chapter resume code.
+            if not item.child_job_id:
+                item.child_job_id = f"{job_id}b{item.index}"
+            _persist_manifest()
+            yield _emit({"type": "batch_progress",
+                         "batch_index": item.index,
+                         "start_page": item.batch.start_page,
+                         "end_page": item.batch.end_page,
+                         **queue.snapshot()})
+
+            plan = parse_audiobook_script(item.batch.script, default_voice=default_voice)
+            if not plan.chapters:
+                # An all-blank page window (rare, but the splitter deliberately
+                # keeps it rather than dropping it — see PdfBatch's docstring):
+                # nothing to synthesize, not a failure.
+                queue.mark_empty(item.index)
+                _persist_manifest()
+                yield _emit({"type": "batch_empty", "batch_index": item.index,
+                             **queue.snapshot()})
+                continue
+
+            child_job_id = item.child_job_id
+            output: str | None = None
+            chapters_done = 0
+            duration_s = 0.0
+            error: str | None = None
+            stopped_mid_batch = False
+            async with contextlib.aclosing(_render_longform_sse(
+                plan, default_voice=default_voice, language=language, fmt=fmt,
+                bitrate=bitrate, loudness=loudness, cover_path=cover_path,
+                metadata=metadata, lexicon=lexicon, opts=opts, voice_map=voice_map,
+                job_type="audiobook", job_id=child_job_id,
+                is_disconnected=is_disconnected,
+            )) as inner_events:
+                async for raw in inner_events:
+                    # _render_longform_sse yields fully-formatted SSE lines; unwrap
+                    # to retag with batch context, matching the parent's own
+                    # f"data: {json.dumps(...)}\n\n" shape so the client parses
+                    # every event (chapter-level or batch-level) identically.
+                    payload = json.loads(raw[len("data: "):].rstrip("\n"))
+                    payload["batch_index"] = item.index
+                    payload["total_batches"] = queue.total
+                    yield _emit(payload, persist=False)
+                    ev_type = payload.get("type")
+                    if ev_type == "done":
+                        output = payload.get("output")
+                        chapters_done = payload.get("chapters", 0)
+                        duration_s = payload.get("duration_s", 0.0)
+                    elif ev_type == "error":
+                        error = payload.get("error") or payload.get("reason") or "render failed"
+                    elif ev_type == "stopped":
+                        stopped_mid_batch = True
+
+            if stopped_mid_batch:
+                # The underlying chapter loop already stopped cleanly (cached
+                # chapters + its own resume manifest are intact); the batch
+                # itself never reached "done", so it stays `running` here and the
+                # queue stops offering further batches rather than guessing at
+                # an outcome. The manifest keeps this item "running" too — a
+                # restart (clean stop or crash) finds the same interrupted batch.
+                queue.mark_stopped()
+                _persist_manifest()
+                yield _emit({"type": "batch_stopped", "batch_index": item.index,
+                             **queue.snapshot()})
+                break
+            if error is not None:
+                queue.mark_failed(item.index, error)
+                _persist_manifest()
+                yield _emit({"type": "batch_failed", "batch_index": item.index,
+                             "error": error, **queue.snapshot()})
+                continue
+            queue.mark_done(item.index, output=output, chapters=chapters_done,
+                            duration_s=duration_s)
+            _persist_manifest()
+            yield _emit({"type": "batch_done", "batch_index": item.index,
+                         "output": output, "chapters": chapters_done,
+                         "duration_s": duration_s, **queue.snapshot()})
+
+        final = queue.snapshot()
+        if job_store is not None:
+            try:
+                if final["status"] == "stopped":
+                    job_store.mark_cancelled(job_id)
+                elif final["status"] == "failed":
+                    job_store.mark_failed(job_id, f"all {queue.total} batches failed to render")
+                else:
+                    job_store.mark_done(job_id)
+            except Exception:
+                pass  # best-effort job history; never block the stream
+        _persist_manifest()
+        # Every batch done/empty needs no further recovery — drop the manifest
+        # and the (possibly sizeable) saved source PDF. A stop/crash, an
+        # all-failed run, or a done-with-failures run all keep both: that IS
+        # the resumable state a later Resume retries (#M1 — a done_with_failures
+        # run used to clear the manifest here too, which deleted the only
+        # record of which batch failed and the source PDF needed to retry it,
+        # silently contradicting this very comment's "recorded failures the
+        # user can see and retry").
+        if final["status"] == "done":
+            pdf_batch_resume.clear_manifest(job_id)
+        yield _emit({"type": "batch_summary", **final})
+    finally:
+        _pdf_batch_jobs_in_flight.discard(job_id)
+
+
+async def _public_pdf_batches_stream(data: bytes | None, **render_kwargs):
+    """Keep generator diagnostics local if setup fails before its own guard —
+    mirrors _public_longform_stream."""
+    try:
+        async with contextlib.aclosing(
+            _render_pdf_batches_sse(data, **render_kwargs)) as events:
+            async for event in events:
+                yield event
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        from core.public_errors import public_failure
+
+        error = public_failure(
+            logger,
+            "PDF batch audiobook stream failed",
+            exc,
+            response="Render failed; check the backend log for details.",
+        )
+        yield f"data: {json.dumps({'type': 'error', 'error': error})}\n\n"
+
+
+@router.post("/audiobook/pdf-batches")
+async def audiobook_pdf_batches(
+    file: UploadFile = File(...),
+    options: str = Form("{}"),
+    batch_size_pages: int = Form(0),
+    request: Request = None,
+):
+    """Split a PDF into page-aligned batches and render each one, in order,
+    as its own independent audiobook (own output file, own cache, own
+    resumability) — for books too large to comfortably render as one job.
+    Streams the same chapter-level SSE events /audiobook does, interleaved
+    with batch-level ``batch_*`` events reporting total/current/completed/
+    failed batches."""
+    from services.pdf_batch_splitter import DEFAULT_BATCH_SIZE_PAGES
+
+    _ensure_active_engine_licence()
+    try:
+        req = PdfBatchAudiobookRequest.model_validate_json(options or "{}")
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=f"invalid options: {e}")
+
+    name = (file.filename or "").lower()
+    if not name.endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="file must be a .pdf")
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="empty file")
+    if len(data) > _IMPORT_MAX_BYTES:
+        raise HTTPException(status_code=400, detail="file too large (max 64 MB)")
+
+    return _longform_response(
+        _public_pdf_batches_stream(
+            data, default_voice=req.default_voice, language=req.language,
+            fmt=req.format, bitrate=req.bitrate,
+            loudness=req.loudness, cover_path=req.cover_path, metadata=req.metadata,
+            lexicon=req.lexicon, opts=_expressive_opts(req), voice_map=req.voice_map,
+            batch_size_pages=batch_size_pages or DEFAULT_BATCH_SIZE_PAGES,
+            source_filename=file.filename or "",
+            is_disconnected=request.is_disconnected if request is not None else None,
+        ),
+    )
+
+
+# ── PDF batch audiobook: durable crash-resume (Stage 3) ────────────────────
+#
+# A backend crash mid-render leaves services.pdf_batch_resume's manifest
+# holding the last-persisted batch array (written on every transition in
+# _render_pdf_batches_sse above) — including a batch still "running" (the
+# one mid-flight when the process died). core.job_store's jobs row for this
+# job is, by Stage 2's unchanged design, flipped to "failed" by the generic
+# startup sweep regardless of how much actually finished (the sweep has no
+# way to know); the manifest is the thing that actually says what to do.
+
+
+@router.get("/audiobook/pdf-batches/jobs")
+def list_resumable_pdf_batch_jobs() -> dict:
+    """List interrupted PDF-batch audiobook jobs that can be resumed — a
+    work dir that still holds a resume manifest. Mirrors ``GET
+    /audiobook/jobs``'s shape for the single-script resume list."""
+    from core import job_store
+    from services import pdf_batch_resume
+
+    out = []
+    for e in pdf_batch_resume.scan_resumable():
+        jid = e["job_id"]
+        manifest = pdf_batch_resume.load_manifest_file(e["manifest_path"]) or {}
+        job = job_store.get(jid) or {}
+        batches = manifest.get("batches", [])
+        completed = [b["index"] for b in batches if b.get("status") in ("done", "empty")]
+        failed = [b["index"] for b in batches if b.get("status") == "failed"]
+        out.append({
+            "job_id": jid,
+            "status": job.get("status", "interrupted"),
+            "title": manifest.get("title") or manifest.get("source_filename", ""),
+            "total_batches": manifest.get("total_batches", len(batches)),
+            "completed_batches": completed,
+            "failed_batches": failed,
+            "created_at": job.get("created_at"),
+        })
+    return {"jobs": out}
+
+
+@router.post("/audiobook/pdf-batches/resume/{job_id}")
+async def resume_pdf_batches(job_id: str, request: Request = None):
+    """Resume an interrupted PDF-batch job from its persisted manifest.
+
+    Every batch already verified complete (file exists, ffprobe-decodable)
+    is preserved untouched; the batch that was mid-render when the process
+    died, any previously-failed batch, and any batch whose output is
+    missing/corrupt are all retried — reusing each one's original child job
+    id, which transparently gets Stage 1/2's existing per-chapter cache for
+    free. Streams the same ``batch_*``/chapter-level SSE events the create
+    endpoint does, plus one ``recovery_summary`` event up front reporting
+    what was verified vs. reset.
+
+    Found via the same trusted-filesystem-enumeration pattern
+    :func:`resume_longform` uses for single-script jobs — the ``job_id``
+    path param only *selects* an entry from that trusted list, never builds
+    a path directly (CodeQL py/path-injection-safe)."""
+    from services import pdf_batch_resume
+
+    entry = next((e for e in pdf_batch_resume.scan_resumable()
+                  if e["job_id"] == job_id), None)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="No resumable PDF batch job for that id")
+    manifest = pdf_batch_resume.load_manifest_file(entry["manifest_path"])
+    if not manifest:
+        raise HTTPException(status_code=404, detail="No resume manifest for that job")
+
+    _ensure_active_engine_licence()
+    return _longform_response(
+        _public_pdf_batches_stream(
+            None, default_voice=None, batch_size_pages=0,
+            job_id=entry["job_id"], resume=True,
             is_disconnected=request.is_disconnected if request is not None else None,
         ),
     )
@@ -1719,3 +2199,662 @@ async def resume_longform(job_id: str, request: Request = None):
             is_disconnected=request.is_disconnected if request is not None else None,
         ),
     )
+
+
+# ── Ebook Translator: POST /audiobook/translate ────────────────────────────
+#
+# Chapter-by-chapter book translation, sharing the Audiobook script format
+# (parse_audiobook_script) and SSE/keepalive plumbing (_longform_response) so
+# a frontend that already consumes the /audiobook stream reuses the same
+# event-handling code, but doing none of the audio work — no ffmpeg, no voice
+# leases, no content-addressed WAV cache. The actual translation of each
+# chapter's segments is services.ebook_translate.translate_segments(), which
+# already bounds every provider call with its own per-chapter wall-clock
+# timeout (see that module's docstring for why asyncio.wait_for cannot
+# actually stop an already-dispatched synchronous/native call — the same
+# limitation applies one level up here, at the per-chapter task below).
+#
+# Resumability/retry is NOT the `jobs`/`job_events` history table — a server
+# restart sweeps any `running` job row to `failed` by design
+# (core.job_store.sweep_orphans_on_startup), so that table is a UI history
+# convenience only. The actual source of truth is
+# studio_projects.ebook_translate_json (its own column — see migration 0018;
+# NOT a sub-key inside the shared state_json blob, which api/routers/
+# projects.py's PUT/POST replace wholesale), written chapter-by-chapter as
+# each one finishes. Each chapter is content-addressed (_chapter_translate_key, folding
+# in its own text + the requested source/target language + provider +
+# instructions + glossary); re-POSTing the identical request — after a crash,
+# after reopening the app, or simply to retry — skips chapters whose key
+# already matches a persisted "done" record and (re)translates only the ones
+# that are missing or previously "failed". No separate retry flag needed.
+
+def _chapter_translate_key(*, title: str, body_texts: list[str], source_lang: "str | None",
+                           target_lang: str, provider: str, instructions: "str | None",
+                           glossary: "list[dict] | None") -> str:
+    """Content-address one chapter's translation inputs. Any change to the
+    chapter's own text, or to how it should be translated, produces a fresh
+    key, so a stale translation is never silently reused. Same sha1-hex idiom
+    as longform_render's chapter cache keys — not a security context."""
+    raw = json.dumps(
+        {"title": title, "body": body_texts, "source_lang": source_lang,
+         "target_lang": target_lang, "provider": provider,
+         "instructions": instructions or "", "glossary": glossary or []},
+        sort_keys=True, ensure_ascii=False,
+    )
+    return hashlib.sha1(raw.encode("utf-8"), usedforsecurity=False).hexdigest()[:16]
+
+
+def _project_exists(project_id: str) -> bool:
+    from core.db import db_conn
+    with db_conn() as conn:
+        row = conn.execute("SELECT id FROM studio_projects WHERE id=?", (project_id,)).fetchone()
+    return row is not None
+
+
+def _load_translate_state(project_id: str) -> dict:
+    """The project's persisted translation progress, or {} if there's none yet
+    (no run started, or the project row is gone). Lives in its own
+    ``ebook_translate_json`` column (migration 0018) — NOT inside the shared
+    ``state_json`` blob api/routers/projects.py's PUT/POST replace wholesale,
+    so an ordinary project autosave can never erase it."""
+    from core.db import db_conn
+    with db_conn() as conn:
+        row = conn.execute(
+            "SELECT ebook_translate_json FROM studio_projects WHERE id=?", (project_id,)).fetchone()
+    if row is None or not row["ebook_translate_json"]:
+        return {}
+    try:
+        state = json.loads(row["ebook_translate_json"])
+    except (ValueError, TypeError):
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def _persist_chapter_record(project_id: str, chapter_index: int, record: dict, *,
+                            target_lang: str, provider: str, total: int) -> bool:
+    """Merge ONE chapter's record into the CURRENT persisted state, read
+    fresh in this same call — never a generator's possibly-stale in-memory
+    snapshot of the whole ``chapters`` dict. A project-level run guard
+    (``_ACTIVE_TRANSLATE_RUNS``) makes two concurrent writers for the same
+    project impossible in the first place, but this is deliberate defense in
+    depth: even if that guard were ever bypassed, this function cannot lose
+    another writer's chapter the way a blind full-dict replace would.
+
+    Also prunes any chapter index >= ``total`` — a book resubmitted with
+    fewer chapters than a previous run must not leave stale, out-of-range
+    chapter records behind (they would otherwise make
+    ``translated_chapters`` exceed ``total_chapters`` in the status
+    response).
+
+    Best-effort: returns False if the project row vanished mid-run (nothing
+    to persist to — the chapter still translated, it just has nowhere
+    durable to land); callers must not treat that as a reason to fail the
+    chapter."""
+    from core.db import db_conn
+    with db_conn() as conn:
+        row = conn.execute(
+            "SELECT ebook_translate_json FROM studio_projects WHERE id=?", (project_id,)).fetchone()
+        if row is None:
+            return False
+        try:
+            state = json.loads(row["ebook_translate_json"]) if row["ebook_translate_json"] else {}
+            if not isinstance(state, dict):
+                state = {}
+        except (ValueError, TypeError):
+            state = {}
+        chapters = state.get("chapters")
+        chapters = dict(chapters) if isinstance(chapters, dict) else {}
+        chapters[str(chapter_index)] = record
+        chapters = {k: v for k, v in chapters.items() if _safe_chapter_index(k) < total}
+        state["chapters"] = chapters
+        state["target_lang"] = target_lang
+        state["provider"] = provider
+        state["total_chapters"] = total
+        state["updated_at"] = time.time()
+        conn.execute(
+            "UPDATE studio_projects SET ebook_translate_json=? WHERE id=?",
+            (json.dumps(state, ensure_ascii=False), project_id),
+        )
+    return True
+
+
+def _safe_chapter_index(key: str) -> int:
+    try:
+        return int(key)
+    except (TypeError, ValueError):
+        return -1  # an unparseable key is always pruned, never kept
+
+
+def _prune_stale_chapters(project_id: str, *, target_lang: str, provider: str, total: int) -> None:
+    """Drop any persisted chapter index >= ``total`` even when no chapter in
+    THIS run needs a (re)translation write of its own — e.g. every chapter
+    hit the content-addressed cache. Without this, a book shortened after a
+    prior longer run would only get pruned on its NEXT edit that happens to
+    touch a real chapter, not on a run that is otherwise a no-op."""
+    from core.db import db_conn
+    with db_conn() as conn:
+        row = conn.execute(
+            "SELECT ebook_translate_json FROM studio_projects WHERE id=?", (project_id,)).fetchone()
+        if row is None or not row["ebook_translate_json"]:
+            return
+        try:
+            state = json.loads(row["ebook_translate_json"])
+            if not isinstance(state, dict):
+                return
+        except (ValueError, TypeError):
+            return
+        chapters = state.get("chapters")
+        if not isinstance(chapters, dict):
+            return
+        pruned = {k: v for k, v in chapters.items() if _safe_chapter_index(k) < total}
+        if len(pruned) == len(chapters):
+            return  # nothing to prune — skip the write
+        state["chapters"] = pruned
+        state["target_lang"] = target_lang
+        state["provider"] = provider
+        state["total_chapters"] = total
+        state["updated_at"] = time.time()
+        conn.execute(
+            "UPDATE studio_projects SET ebook_translate_json=? WHERE id=?",
+            (json.dumps(state, ensure_ascii=False), project_id),
+        )
+
+
+# ── Project-level translate run guard ───────────────────────────────────────
+#
+# Prevents two /audiobook/translate streams from running for the SAME
+# project at once — without it, two concurrent runs each hold their own
+# generator-lifetime snapshot and the second to finish can still end up
+# overwriting what the first one wrote (the per-chapter merge in
+# _persist_chapter_record is defense in depth for that, not a substitute for
+# simply not letting it happen).
+#
+# In-memory and process-local: this backend runs as one local process per
+# user, not a multi-worker server, so a plain dict guarded by nothing but the
+# asyncio event loop's single-threadedness is enough — there is no `await`
+# between the membership check and the insert in _acquire_translate_lock, so
+# no other coroutine on this loop can interleave inside it.
+#
+# Lifecycle note (do NOT assume an async generator's `finally` always runs):
+# Starlette's StreamingResponse.stream_response does `async for chunk in
+# self.body_iterator` with no try/finally of its own, and on older ASGI
+# servers (spec_version < 2.4) it races that against listen_for_disconnect in
+# a task group — if the disconnect listener wins before the body iterator is
+# ever awaited once, our generator can be cancelled having NEVER started,
+# meaning its own try/finally never executes and never gets the chance to
+# release anything (verified by reading Starlette 1.6's actual source, not
+# assumed). So release is NOT solely the generator's job:
+#   * acquired in the sync route handler, which also releases it directly if
+#     constructing the response fails before any streaming starts;
+#   * refreshed once per chapter boundary while the generator runs, so a
+#     genuinely long multi-chapter book never looks abandoned;
+#   * released in the generator's own outer `finally` on every real
+#     completion path (done, chapter_error exhausted, stopped, cancelled,
+#     unexpected exception);
+#   * and self-heals even if NONE of the above ran at all (process kill,
+#     or the Starlette race above): a stale entry — no refresh for longer
+#     than a generous multiple of the per-chapter timeout — is treated as
+#     abandoned and silently reclaimed by the next request for that project.
+#   * a backend restart trivially "releases" every entry: this dict is
+#     process memory, so a fresh process starts with it empty.
+_ACTIVE_TRANSLATE_RUNS: dict[str, tuple[str, float]] = {}  # project_id -> (job_id, last_heartbeat)
+
+
+def _translate_lock_stale_after_s() -> float:
+    """Comfortably above any single chapter's own asyncio.wait_for budget
+    (services.ebook_translate.chapter_translate_timeout_s), with a safety
+    multiplier for scheduling jitter — so an actually-active run, even one
+    deliberately configured with a long per-chapter timeout, is never
+    misclassified as abandoned."""
+    return max(300.0, ebook_translate.chapter_translate_timeout_s() * 3)
+
+
+def _acquire_translate_lock(project_id: str, job_id: str) -> bool:
+    """True if this job now owns the lock for ``project_id``; False if
+    another run genuinely still owns it. Self-heals a stale entry."""
+    existing = _ACTIVE_TRANSLATE_RUNS.get(project_id)
+    if existing is not None:
+        _existing_job_id, last_beat = existing
+        if (time.monotonic() - last_beat) < _translate_lock_stale_after_s():
+            return False
+    _ACTIVE_TRANSLATE_RUNS[project_id] = (job_id, time.monotonic())
+    return True
+
+
+def _refresh_translate_lock(project_id: str, job_id: str) -> None:
+    """Re-affirm liveness after each chapter. A no-op if this job no longer
+    owns the entry (e.g. it was already reclaimed as stale, which should not
+    happen in practice while this job is actually still running, but must
+    never resurrect a lock that moved on)."""
+    existing = _ACTIVE_TRANSLATE_RUNS.get(project_id)
+    if existing is not None and existing[0] == job_id:
+        _ACTIVE_TRANSLATE_RUNS[project_id] = (job_id, time.monotonic())
+
+
+def _release_translate_lock(project_id: str, job_id: str) -> None:
+    existing = _ACTIVE_TRANSLATE_RUNS.get(project_id)
+    if existing is not None and existing[0] == job_id:
+        _ACTIVE_TRANSLATE_RUNS.pop(project_id, None)
+
+
+async def _translate_longform_sse(
+    plan,
+    *,
+    project_id: str,
+    source_lang: "str | None",
+    target_lang: str,
+    provider: str,
+    glossary: "list[dict] | None",
+    instructions: "str | None",
+    job_id: str,
+    is_disconnected: "Callable[[], Awaitable[bool]] | None" = None,
+):
+    """SSE generator for POST /audiobook/translate — one
+    services.ebook_translate.translate_segments() call per chapter (that
+    module's own docstring: "a chapter is the unit of resumability").
+
+    A chapter is persisted "done" only when EVERY segment in it translated
+    with no error. One failed segment fails the WHOLE chapter — its
+    ``translated_*`` fields are left unset rather than populated from
+    ebook_translate's own per-segment degrade-to-source-text value, which
+    would otherwise read as "translated" when it is actually the original
+    text with an ``error`` attached. This route's persisted record is the
+    thing a caller trusts to decide whether it's safe to generate audio from
+    the result, so it must never blur "failed" into "done".
+
+    ``job_id`` is required and already sanitized + registered in
+    ``job_store`` by the route handler (``audiobook_translate``), which also
+    already owns the ``_ACTIVE_TRANSLATE_RUNS`` lock for ``project_id`` by
+    the time this generator is even constructed — see the lock-lifecycle
+    note above ``_ACTIVE_TRANSLATE_RUNS`` for why the lock's acquisition
+    cannot live here.
+    """
+    try:
+        from core import job_store
+        job_store.mark_running(job_id)
+    except Exception:
+        job_store = None  # job history is best-effort; never block translation
+
+    def _emit(payload: dict, *, persist: bool = True) -> str:
+        if persist and job_store is not None:
+            try:
+                job_store.append_event(job_id, json.dumps(payload))
+            except Exception:
+                pass  # best-effort job history; never block the stream
+        return f"data: {json.dumps(payload)}\n\n"
+
+    def _retire_failed(reason: str) -> None:
+        if job_store is not None:
+            try:
+                job_store.retire_if_active(job_id, "failed", reason)
+            except Exception:
+                pass
+
+    total = len(plan.chapters)
+    if total == 0:
+        _retire_failed("nothing to translate (no chapters)")
+        yield _emit({"type": "error", "error": "nothing to translate (no chapters)"})
+        return
+
+    chapters_state: dict = dict(_load_translate_state(project_id).get("chapters") or {})
+    # A book resubmitted shorter than a previous run leaves no chapter in
+    # THIS run that would otherwise trigger the per-chapter prune inside
+    # _persist_chapter_record — do it once up front so a run with nothing to
+    # (re)translate still converges stale out-of-range records away.
+    _prune_stale_chapters(project_id, target_lang=target_lang, provider=provider, total=total)
+    translated_n = 0
+    failed_indices: "list[int]" = []
+    interrupted = False
+
+    yield _emit({"type": "started", "job_id": job_id, "project_id": project_id, "chapters": total})
+
+    try:
+        for i, chapter in enumerate(plan.chapters):
+            # Client-disconnect cancellation, checked at the chapter boundary
+            # exactly like _render_longform_sse (#1216's pattern): a stop is
+            # clean, every chapter persisted so far stays persisted, and a
+            # later re-POST of the same request finishes the rest cheaply
+            # (the content-addressed skip below).
+            if is_disconnected is not None:
+                try:
+                    gone = await is_disconnected()
+                except Exception:
+                    gone = False
+                if gone:
+                    interrupted = True
+                    break
+            # Re-affirm liveness every chapter boundary (including a cached
+            # skip) so a genuinely long multi-chapter book never looks
+            # abandoned to another request's staleness check.
+            _refresh_translate_lock(project_id, job_id)
+
+            body_texts = [s.text for s in chapter.spans if (s.text or "").strip()]
+            key = _chapter_translate_key(
+                title=chapter.title, body_texts=body_texts, source_lang=source_lang,
+                target_lang=target_lang, provider=provider, instructions=instructions,
+                glossary=glossary,
+            )
+            existing = chapters_state.get(str(i))
+            if existing and existing.get("status") == "done" and existing.get("key") == key:
+                translated_n += 1
+                yield _emit({"type": "chapter", "index": i, "total": total,
+                             "title": chapter.title, "cached": True})
+                continue
+
+            segments = [ebook_translate.EbookSegment(id="title", text=chapter.title)]
+            for j, span in enumerate(chapter.spans):
+                if (span.text or "").strip():
+                    segments.append(ebook_translate.EbookSegment(id=f"span{j}", text=span.text))
+            # Informational only (ebook_translate.translate_segments resolves
+            # this itself, per chapter, from the SAME inputs) — recorded so
+            # GET /audiobook/translate/{project_id} can show what was used,
+            # without this route re-deciding or overriding that resolution.
+            resolved_lang_for_display = ebook_translate.resolve_source_lang(segments, source_lang)
+
+            record = {
+                "index": i, "key": key, "source_lang": resolved_lang_for_display,
+                "source_title": chapter.title,
+                "source_spans": [s.to_dict() for s in chapter.spans],
+                "status": "pending", "translated_title": None, "translated_spans": None,
+                "error": None, "updated_at": time.time(),
+            }
+
+            task = asyncio.ensure_future(ebook_translate.translate_segments(
+                segments, source_lang=source_lang, target_lang=target_lang,
+                provider=provider, glossary=glossary, instructions=instructions,
+            ))
+            try:
+                results = await task
+            except (ebook_translate.UnsupportedProviderError,
+                     ebook_translate.UnsupportedLanguageError) as e:
+                # A request-level setup problem (unsupported language pair for
+                # this provider, discovered only once a real chapter's
+                # segments are resolved) would fail IDENTICALLY for every
+                # remaining chapter — stop the whole run instead of burning
+                # each chapter's timeout on a guaranteed-to-fail call.
+                _retire_failed(str(e))
+                yield _emit({"type": "error", "error": str(e)})
+                return
+            except Exception as e:  # isolate a bad chapter — keep going
+                logger.warning("[%s] chapter %d (%s) failed to translate",
+                               job_id, i, chapter.title, exc_info=True)
+                record["status"] = "failed"
+                record["error"] = f"{type(e).__name__}: {e}"
+                _persist_chapter_record(project_id, i, record, target_lang=target_lang,
+                                        provider=provider, total=total)
+                failed_indices.append(i)
+                yield _emit({"type": "chapter_error", "index": i, "total": total,
+                             "title": chapter.title, "error": record["error"]})
+                continue
+            finally:
+                if not task.done():
+                    # The stream was cancelled/closed mid-chapter: stop
+                    # awaiting it and never leave its outcome unretrieved.
+                    # Cancelling this asyncio Future only stops US from
+                    # waiting — it does NOT stop the synchronous/native call
+                    # services.ebook_translate dispatched to a worker thread
+                    # (model.generate, argostranslate.translate, an LLM HTTP
+                    # request); that thread keeps running until it returns on
+                    # its own, exactly the trade-off documented in
+                    # ebook_translate's module docstring and
+                    # services.asr_backend.run_transcribe_guarded.
+                    task.cancel()
+                    task.add_done_callback(lambda t: t.cancelled() or t.exception())
+
+            by_id = {r["id"]: r for r in results}
+            title_result = by_id.get("title", {"text": chapter.title})
+            errors = [r.get("error") for r in results if r.get("error")]
+            if errors:
+                # ANY failed segment fails the whole chapter (see this
+                # function's docstring) — never partially "done".
+                record["status"] = "failed"
+                record["error"] = "; ".join(str(e) for e in errors[:3])
+                _persist_chapter_record(project_id, i, record, target_lang=target_lang,
+                                        provider=provider, total=total)
+                failed_indices.append(i)
+                yield _emit({"type": "chapter_error", "index": i, "total": total,
+                             "title": chapter.title, "error": record["error"]})
+                continue
+
+            translated_spans = []
+            for j, span in enumerate(chapter.spans):
+                d = span.to_dict()
+                if (span.text or "").strip():
+                    r = by_id.get(f"span{j}")
+                    if r is not None:
+                        d["text"] = r["text"]
+                translated_spans.append(d)
+
+            record["status"] = "done"
+            record["translated_title"] = title_result["text"]
+            record["translated_spans"] = translated_spans
+            record["updated_at"] = time.time()
+            _persist_chapter_record(project_id, i, record, target_lang=target_lang,
+                                    provider=provider, total=total)
+            translated_n += 1
+            yield _emit({"type": "chapter", "index": i, "total": total,
+                         "title": chapter.title, "cached": False})
+
+        if interrupted:
+            logger.info("[%s] client disconnected — stopped after %d/%d chapters",
+                        job_id, translated_n, total)
+            if job_store is not None:
+                try:
+                    job_store.mark_cancelled(job_id)
+                except Exception:
+                    pass
+            # Deliberately do not touch the persisted chapters: they stay
+            # exactly as written, so a re-POST resumes from here.
+            yield _emit({"type": "stopped", "translated": translated_n, "total": total,
+                         "failed_chapters": failed_indices})
+            return
+
+        if job_store is not None:
+            try:
+                job_store.mark_done(job_id)
+            except Exception:
+                pass
+        try:
+            from core import event_bus
+            event_bus.emit("projects", {"action": "updated", "id": project_id})
+        except Exception:
+            pass  # UI refetch nudge only; never block the terminal event
+        yield _emit({"type": "done", "project_id": project_id, "chapters": total,
+                     "translated_chapters": translated_n, "failed_chapters": failed_indices,
+                     # The single flag a caller must check before trusting this
+                     # project's translated text for anything (e.g. audiobook
+                     # generation) — false whenever any chapter failed.
+                     "complete": not failed_indices})
+    except (asyncio.CancelledError, GeneratorExit):
+        if job_store is not None:
+            try:
+                job_store.retire_if_active(job_id, "cancelled")
+            except Exception:
+                pass
+        raise
+    except Exception as e:  # surface, don't 500 the stream
+        logger.exception("[%s] ebook translation failed", job_id)
+        if job_store is not None:
+            try:
+                job_store.mark_failed(job_id, str(e))
+            except Exception:
+                pass
+        yield _emit({"type": "error", "error": "translation failed (see backend log)"})
+    finally:
+        # Runs on every real completion path (done, stopped, cancelled,
+        # unexpected exception) — the lock-staleness self-heal in
+        # _acquire_translate_lock covers the one path this cannot: the
+        # generator never starting at all. See the lock-lifecycle note
+        # above _ACTIVE_TRANSLATE_RUNS.
+        _release_translate_lock(project_id, job_id)
+
+
+async def _public_ebook_translate_stream(plan, **render_kwargs):
+    """Keep generator diagnostics local if setup fails before its own guard —
+    mirrors _public_longform_stream."""
+    try:
+        async with contextlib.aclosing(_translate_longform_sse(plan, **render_kwargs)) as events:
+            async for event in events:
+                yield event
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        from core.public_errors import public_failure
+
+        error = public_failure(
+            logger, "Ebook translation response stream failed", exc,
+            response="Translation failed; check the backend log for details.",
+        )
+        yield f"data: {json.dumps({'type': 'error', 'error': error})}\n\n"
+
+
+@router.post("/audiobook/translate")
+async def audiobook_translate(req: EbookTranslateRequest, request: Request = None):
+    """Translate a chapter-delimited script chapter-by-chapter, streaming SSE
+    progress. Progress for ``req.project_id`` persists durably — see the
+    module section docstring above and ``GET /audiobook/translate/{project_id}``
+    to read it back without starting a new run."""
+    if not _project_exists(req.project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    target_lang = (req.target_lang or "").strip()
+    if not target_lang:
+        raise HTTPException(status_code=400, detail="target_lang is required")
+    provider = (req.provider or "argos").lower()
+
+    from services import translation_engines
+    if not translation_engines.get_engine(provider):
+        raise HTTPException(status_code=400, detail=f"Unknown translation provider: {provider!r}")
+    if provider == "openai":
+        # The LLM path is routed through the "ebook_translation" skill, not
+        # translation_engines' own global-active-provider probe — a skill can
+        # be disabled, or overridden to a different provider than the active
+        # one, so this is the only check that reflects what will actually run.
+        from services import llm_skills
+        res = llm_skills.resolve_skill("ebook_translation")
+        if not res.ready:
+            if res.reason == "disabled":
+                detail = ("The LLM translation engine is turned off — enable the "
+                          "'Ebook translation' skill in Settings -> LLM Skills, or "
+                          "pick another provider.")
+            else:
+                detail = ("The LLM translation engine has no provider configured. "
+                          "Add and test one in Settings -> LLM Providers, or pick "
+                          "another provider.")
+            raise HTTPException(status_code=409, detail=detail)
+    elif not translation_engines.is_ready(provider):
+        raise HTTPException(
+            status_code=409,
+            detail=f"The '{provider}' translation engine isn't installed/configured yet.")
+
+    plan = parse_audiobook_script(req.text)
+    if plan.chapter_count > _MAX_CHAPTERS:
+        raise HTTPException(status_code=422, detail=f"too many chapters (max {_MAX_CHAPTERS})")
+
+    # Last gate, after every other validation has already passed: nothing
+    # between here and `return` can itself raise before the lock is either
+    # handed to the generator or explicitly released below, so it can never
+    # be acquired and then silently abandoned by a validation error.
+    job_id = uuid.uuid4().hex[:16]
+    if not _acquire_translate_lock(req.project_id, job_id):
+        raise HTTPException(
+            status_code=409,
+            detail="A translation is already running for this project. Wait for it to "
+                   "finish (or let it time out) before retrying.")
+    try:
+        from core import job_store
+        job_store.create(job_id, type="ebook_translate", project_id=req.project_id)
+        return _longform_response(
+            _public_ebook_translate_stream(
+                plan, project_id=req.project_id, source_lang=req.source_lang,
+                target_lang=target_lang, provider=provider, glossary=req.glossary,
+                instructions=req.translation_instructions, job_id=job_id,
+                is_disconnected=request.is_disconnected if request is not None else None,
+            ),
+        )
+    except Exception:
+        # Response construction failed before any streaming started — the
+        # generator's own `finally` will never run for a stream that never
+        # began, so release directly here (see the lock-lifecycle note above
+        # _ACTIVE_TRANSLATE_RUNS).
+        _release_translate_lock(req.project_id, job_id)
+        try:
+            job_store.retire_if_active(job_id, "failed", "stream setup failed")
+        except Exception:
+            pass
+        raise
+
+
+@router.get("/audiobook/translate/{project_id}")
+def get_translate_status(project_id: str) -> dict:
+    """Read back a project's persisted translation progress — recovery after
+    a backend restart or reopening the app, and the status a caller must
+    check (``complete``) before treating the translated text as safe to use
+    for anything downstream (e.g. generating an audiobook from it). 404 only
+    when the project itself doesn't exist; a project with no translation run
+    yet returns a zero-chapter, not-complete state rather than 404."""
+    if not _project_exists(project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    state = _load_translate_state(project_id)
+    chapters: dict = state.get("chapters") or {}
+    total = int(state.get("total_chapters") or 0)
+    done = sorted(int(k) for k, c in chapters.items() if c.get("status") == "done")
+    failed = sorted(int(k) for k, c in chapters.items() if c.get("status") == "failed")
+    return {
+        "project_id": project_id,
+        "total_chapters": total,
+        "translated_chapters": len(done),
+        "failed_chapters": failed,
+        "target_lang": state.get("target_lang"),
+        "provider": state.get("provider"),
+        "updated_at": state.get("updated_at"),
+        # Never true for a project nobody has translated yet (total == 0):
+        # absence of a run must never read as "safe to generate audio from".
+        "complete": bool(total) and not failed and len(done) == total,
+        "chapters": [
+            {
+                "index": int(k),
+                "status": c.get("status"),
+                "error": c.get("error"),
+                "source_lang": c.get("source_lang"),
+                "source_title": c.get("source_title"),
+                "source_spans": c.get("source_spans"),
+                "translated_title": c.get("translated_title"),
+                "translated_spans": c.get("translated_spans"),
+                "updated_at": c.get("updated_at"),
+            }
+            for k, c in sorted(chapters.items(), key=lambda kv: int(kv[0]))
+        ],
+    }
+
+
+def _require_translation_complete(source_project_id: "str | None") -> None:
+    """Backend-enforced guard for POST /audiobook (corrective review,
+    Priority 4): a caller that links a synthesis request to a project's
+    Ebook Translator progress cannot accidentally render incomplete or
+    failed chapters as if they were finished translations.
+
+    ``None`` (every existing caller, and every caller that isn't synthesizing
+    FROM a tracked translation) is a complete no-op — no DB lookup, no
+    behavior change whatsoever from before this field existed. Only a caller
+    that explicitly opts in by setting ``source_project_id`` is checked, and
+    checked against the exact same ``complete`` flag
+    ``GET /audiobook/translate/{project_id}`` already exposes — there is one
+    definition of "complete" in this codebase, not two.
+    """
+    if source_project_id is None:
+        return
+    status = get_translate_status(source_project_id)  # raises 404 if the project is gone
+    if not status["complete"]:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "translation_incomplete",
+                "message": "This project's translation isn't complete yet — finish or "
+                           "retry it before generating an audiobook from it.",
+                "total_chapters": status["total_chapters"],
+                "translated_chapters": status["translated_chapters"],
+                "failed_chapters": status["failed_chapters"],
+            },
+        )

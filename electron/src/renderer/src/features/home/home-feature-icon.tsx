@@ -62,6 +62,7 @@ export function HomeFeatureIcon({ destination }: { destination: string }) {
           </>
         );
       case '/audiobook':
+      case '/pdf-reader':
         return (
           <>
             <path d="M16 8C12 5 7 5 3 6v20c5-1 9-1 13 2 4-3 8-3 13-2V6c-4-1-9-1-13 2Zm0 0v20" />

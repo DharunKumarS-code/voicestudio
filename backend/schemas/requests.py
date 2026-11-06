@@ -301,3 +301,25 @@ class ProjectSaveRequest(BaseModel):
     audio_path: Optional[str] = None
     duration: Optional[float] = None
     state: dict  # Full JSON blob: segments, settings, tracks, etc.
+
+
+class EbookTranslateRequest(BaseModel):
+    """POST /audiobook/translate — chapter-by-chapter book translation.
+
+    ``text`` is the same chapter-delimited script ``AudiobookPlanRequest`` /
+    ``AudiobookRequest`` already accept (``# H1`` headings, inline
+    ``[voice:NAME]``/``[pause ...]``) — translating a book starts from the
+    identical plan Audiobook would synthesize from, so the two features never
+    disagree about what a "chapter" is. ``project_id`` must name an existing
+    ``studio_projects`` row: translation progress persists there (original and
+    translated text, per chapter, independently), so the same request re-POSTed
+    after a crash/restart or a partial failure only (re)translates chapters that
+    aren't already done — see services.ebook_translate and the route docstring.
+    """
+    project_id: str
+    text: str
+    target_lang: str
+    provider: Optional[str] = None
+    source_lang: Optional[str] = None
+    glossary: Optional[List[dict]] = None
+    translation_instructions: Optional[str] = Field(default=None, max_length=5000)

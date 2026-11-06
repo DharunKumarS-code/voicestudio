@@ -1,0 +1,1 @@
+PDF Voice Reader: open a PDF in your browser and hear it read aloud live from any page or sentence; it takes the Audiobook entry's place in the sidebar, Home and command search — thanks @DharunKumarS-code!

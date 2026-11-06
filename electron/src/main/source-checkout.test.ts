@@ -90,6 +90,17 @@ it('explains a ZIP download, which has the files but no git history', () => {
   expect(inspectSourceCheckout(root)).toEqual({ ok: false, reason: 'not_git' });
 });
 
+it('explains a ZIP download inside a git-tracked home folder', () => {
+  // A dotfiles repo at the home folder encloses everything the user unzips.
+  mkdirSync(join(base, '.git'));
+  const root = freshClone(join(base, 'Downloads', 'VoiceStudio-main'), { git: false });
+  expect(inspectSourceCheckout(root)).toEqual({ ok: false, reason: 'not_git' });
+  expect(inspectSourceCheckout(join(root, 'electron', 'src', 'main'))).toEqual({
+    ok: false,
+    reason: 'not_git',
+  });
+});
+
 it('explains an unrelated git repository', () => {
   mkdirSync(join(base, '.git'));
   touch(join(base, 'package.json'));

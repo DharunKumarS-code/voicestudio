@@ -505,6 +505,11 @@ async def ws_tts(websocket: WebSocket):
                     f"{rtf:.3f}" if rtf is not None else "n/a",
                 )
 
+            except WebSocketDisconnect:
+                # The client hung up mid-stream (a reader's Stop / page jump).
+                # Not a synthesis failure: end quietly instead of logging a
+                # traceback and trying to send an error frame to a closed socket.
+                break
             except Exception as e:
                 from core.failure import licence_required_detail
 

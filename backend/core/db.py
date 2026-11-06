@@ -91,6 +91,22 @@ _BASE_SCHEMA = """
         content_hash TEXT DEFAULT '',
         created_at REAL
     );
+    -- studio_projects.ebook_translate_json: Ebook Translator progress (chapter
+    -- statuses + original/translated text), owned exclusively by
+    -- api/routers/audiobook.py. A dedicated column on purpose:
+    -- api/routers/projects.py's PUT/POST write a full `state_json` replacement
+    -- from client-supplied state with no merge, so anything sharing that blob
+    -- is erased by an ordinary project autosave. Giving this its own column
+    -- makes that structurally impossible rather than relying on every
+    -- state_json writer remembering to preserve a sub-key it doesn't know
+    -- about. Fresh installs get it here; existing DBs get it via migration
+    -- 0018_studio_project_ebook_translate_column (which also moves any
+    -- pre-existing state_json["ebook_translate"] data over) or, if alembic
+    -- can't run, via _reconcile_additive_columns.
+    -- Keep this note OUTSIDE the CREATE TABLE: SQLite stores the table's SQL
+    -- verbatim, and ALTER TABLE ... DROP COLUMN on the last column mistakes a
+    -- comma inside a comment for the column separator, corrupting the schema
+    -- ("incomplete input") and breaking migration 0018's downgrade.
     CREATE TABLE IF NOT EXISTS studio_projects (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -99,7 +115,8 @@ _BASE_SCHEMA = """
         duration REAL,
         state_json TEXT,
         created_at REAL,
-        updated_at REAL
+        updated_at REAL,
+        ebook_translate_json TEXT DEFAULT NULL
     );
     CREATE TABLE IF NOT EXISTS export_history (
         id TEXT PRIMARY KEY,

@@ -1768,6 +1768,20 @@ def clear_clone_prompt_cache() -> None:
 # reaches this module through sys.modules rather than importing it, so there is
 # no import cycle and no import-time side effect here.
 
+# Stage A warm-up: a short, fixed sentence used ONLY to pay the first-call
+# tax (weight load, plus on CUDA the model's torch.compile/CUDA-graph
+# capture — see model_manager._resolved_compile_mode) at startup instead of
+# on a user's first real request. Deliberately short: this warms the single
+# shape it is itself synthesized at, not every shape a real book's chapters
+# will use — see services.tts_backend.OmniVoiceBackend.warmup and
+# engines.omnivoice_subprocess.OmniVoiceSubprocessBackend.warmup, both of
+# which just call generate() with this text. One constant shared by both so
+# a future change to the warm-up shape only has one place to make it.
+TTS_WARMUP_TEXT = (
+    "This is a short warm-up line used to prepare the speech engine before "
+    "the first real request."
+)
+
 
 class OmniVoiceBackend(TTSBackend):
     """Wraps `omnivoice.models.omnivoice.OmniVoice`. Zero behaviour change.
@@ -1901,6 +1915,30 @@ class OmniVoiceBackend(TTSBackend):
             self._model, ref_audio=ref_audio, ref_text=ref_text, **gen_kw
         )
         return audios[0]
+
+    def warmup(self) -> None:
+        """Pay the first-call cold-start tax here, at startup, instead of on
+        a user's first real request (Stage A, TTS Performance Investigation).
+
+        Just calls ``generate()`` — the exact same path a real request takes
+        — with a short, fixed sentence (``TTS_WARMUP_TEXT``). That means it:
+        * cannot create a duplicate model instance: ``_ensure_loaded()``
+          reuses ``model_manager``'s shared singleton exactly as any other
+          caller does, loading it only if nothing already has;
+        * inherits every existing safety check for free (model-licence
+          gating, the VRAM-eviction-before-load path, the idle-unload timer
+          that already governs this same model) because it IS that path, not
+          a parallel one;
+        * on CUDA, additionally forces the model's first ``torch.compile``
+          call (and, in "reduce-overhead" mode, its first CUDA-graph
+          capture) to happen now rather than on the first real chapter — the
+          cost ``preload_model()`` does not cover, since that function only
+          loads weights and never calls ``generate()``.
+
+        Caller's responsibility to catch/log — this does not swallow its own
+        exceptions, matching ``generate()``'s own contract.
+        """
+        self.generate(TTS_WARMUP_TEXT)
 
     def generate_batch(self, texts: list[str], **kw) -> list[torch.Tensor]:
         """Use OmniVoice's native variable-length batch generation.

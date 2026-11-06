@@ -26,6 +26,8 @@ vi.mock('@/components/app-shell/workspace-header', () => ({
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (key: string) => key }),
 }));
+const reader = vi.hoisted(() => ({ open: vi.fn(async () => ({ ok: true })) }));
+vi.mock('@/lib/pdf-reader', () => ({ openPdfReader: reader.open }));
 import { HomePage } from './home-page';
 import { homeContributors } from './home-contributors-data';
 import en from '@/i18n/locales/en.json';
@@ -131,7 +133,7 @@ it('gives velixio the same hover card as the creator', async () => {
   );
 });
 
-it('separates three primary creation actions and describes all nine destinations', () => {
+it('separates three primary creation actions and describes all ten destinations', () => {
   render(<HomePage />);
   const clone = screen.getByRole('link', { name: /nav.clone/ });
   const primary = clone.parentElement!;
@@ -140,15 +142,28 @@ it('separates three primary creation actions and describes all nine destinations
     '/design',
     '/dub',
   ]);
-  expect(primary.nextElementSibling?.querySelectorAll('a')).toHaveLength(6);
+  // Seven secondary destinations: New Audiobook plus five other routes, and the
+  // PDF Voice Reader launcher (a separate feature that opens the browser).
+  const secondary = primary.nextElementSibling!;
+  expect(secondary.querySelectorAll('a')).toHaveLength(6);
+  expect(secondary.querySelector('a[href="/audiobook"]')).not.toBeNull();
+  expect(secondary.querySelectorAll('button[data-destination="pdf-reader"]')).toHaveLength(1);
   const icons = document.querySelectorAll('svg.home-feature-svg');
-  expect(icons).toHaveLength(9);
+  expect(icons).toHaveLength(10);
   icons.forEach((icon) => expect(icon).toHaveAttribute('aria-hidden', 'true'));
   for (const key of ['design', 'dub', 'stories', 'audiobook', 'transcribe']) {
     expect(screen.getByText('homeUi.' + key)).toBeVisible();
   }
+  expect(screen.getByText('pdfReader.description')).toBeVisible();
   expect(screen.queryByText('demo.dictation_lede')).not.toBeInTheDocument();
   expect(screen.queryByText('dub.supported_formats')).not.toBeInTheDocument();
   expect(screen.queryByText('clone.history_title')).not.toBeInTheDocument();
   expect(screen.queryByText('0')).not.toBeInTheDocument();
+});
+
+it('opens the PDF Voice Reader from its home card', () => {
+  render(<HomePage />);
+  reader.open.mockClear();
+  fireEvent.click(screen.getByRole('button', { name: /pdfReader\.title/ }));
+  expect(reader.open).toHaveBeenCalledTimes(1);
 });

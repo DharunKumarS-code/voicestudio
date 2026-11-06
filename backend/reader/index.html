@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>VoiceStudio Reader</title>
+  <!-- Inline icon: the backend has no /favicon.ico, so don't let the browser ask for one. -->
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%232f5bd3'/%3E%3Cpath d='M4 4h5a2 2 0 0 1 2 2v6H6a2 2 0 0 1-2-2z' fill='%23fff'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="reader.css" />
+</head>
+<body>
+  <header class="toolbar">
+    <div class="brand">VoiceStudio <span>Reader</span></div>
+
+    <label class="btn file-btn">
+      <input id="file-input" type="file" accept="application/pdf,.pdf" hidden />
+      Open PDF
+    </label>
+
+    <div class="group">
+      <label for="voice-select">Voice</label>
+      <select id="voice-select"><option value="">Loading…</option></select>
+    </div>
+
+    <div class="group">
+      <label for="speed">Speed <output id="speed-out">1.0×</output></label>
+      <input id="speed" type="range" min="0.7" max="1.5" step="0.05" value="1" />
+    </div>
+
+    <div class="group transport">
+      <button id="play-btn" class="btn primary" disabled title="Read from the page shown (Space)">▶ Read this page</button>
+      <button id="pause-btn" class="btn" disabled title="Pause / resume (Space)">❚❚ Pause</button>
+      <button id="stop-btn" class="btn" disabled title="Stop (Esc)">■ Stop</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="viewer">
+      <div class="pager">
+        <button id="prev-btn" class="btn small" disabled title="Previous page (←)">‹</button>
+        <span>Page <input id="page-input" type="number" min="1" value="1" disabled /> of <b id="page-count">–</b></span>
+        <button id="next-btn" class="btn small" disabled title="Next page (→)">›</button>
+        <label class="follow"><input id="follow" type="checkbox" checked /> Follow narration</label>
+      </div>
+      <div id="canvas-wrap" class="canvas-wrap">
+        <div id="empty" class="empty">
+          <p><b>Open a PDF</b> to start.</p>
+          <p>Pick a page, then press <b>Read this page</b>. Narration starts within seconds
+            and keeps going page after page until you stop it.</p>
+        </div>
+        <canvas id="pdf-canvas" hidden></canvas>
+      </div>
+    </section>
+
+    <aside class="textpane">
+      <h2 id="text-title">Page text</h2>
+      <p class="hint">Click any sentence to start reading from there.</p>
+      <div id="page-text" class="page-text"></div>
+    </aside>
+  </main>
+
+  <footer class="statusbar">
+    <span id="status" class="status">Connecting to backend…</span>
+    <span id="metrics" class="metrics"></span>
+  </footer>
+
+  <script src="vendor/pdfjs/pdf.min.js"></script>
+  <script src="reader.js"></script>
+</body>
+</html>

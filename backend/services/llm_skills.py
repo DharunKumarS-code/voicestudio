@@ -5,7 +5,7 @@ the Settings → LLM Skills panel can (a) toggle it and (b) route it to a
 specific provider (a local Ollama/LM Studio vs a remote key) instead of
 everything riding the one global active provider.
 
-The six consumption points today:
+The seven consumption points today:
 
     dub_translation       — api/routers/dub_translate.py (the Dub tab's direct
                             "LLM" translation engine; provider=openai branch)
@@ -18,6 +18,11 @@ The six consumption points today:
                             taxonomy tokens; /tools/direction + dub generate)
     dictation_refinement  — services/refinement.py (dictation transcript
                             cleanup on finals)
+    ebook_translation      — services/ebook_translate.py (the Ebook Translator's
+                            "LLM" provider; chapter-level, no timing concept —
+                            routed independently of dub_translation so a user
+                            can point book translation at a different/slower-
+                            but-better model than they use for dub)
 
 Design rules:
 
@@ -78,6 +83,7 @@ _SKILLS: tuple[LLMSkill, ...] = (
     _skill("glossary_extract"),
     _skill("direction_parse"),
     _skill("dictation_refinement"),
+    _skill("ebook_translation"),
 )
 
 _BY_ID: dict[str, LLMSkill] = {s.id: s for s in _SKILLS}

@@ -123,7 +123,8 @@ def test_shutdown_wait_bound_is_long_enough_for_a_cold_import():
     names = r"\s*,\s*".join(
         rf'getattr\(app\.state,\s*"{n}",\s*None\)'
         for n in ("idle_task", "worker_task", "profile_reconcile_task",
-                  "preload_task", "capture_preload_task", "watermark_preload_task")
+                  "preload_task", "capture_preload_task", "watermark_preload_task",
+                  "tts_warmup_task")
     )
     m = re.search(
         rf"await _cancel_and_await_tasks\(\s*{names}\s*,\s*timeout=([0-9.]+)\s*,?\s*\)", src

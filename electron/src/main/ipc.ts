@@ -1,4 +1,5 @@
 import { registerSiteBrowser } from './site-browser';
+import { registerReaderLauncher } from './reader-launcher';
 import { portableFilename } from './portable-filename';
 import { saveFiltersFor } from './save-filters';
 import { resolveBackendDownloadUrl } from './backend-download';
@@ -328,6 +329,7 @@ export function registerIpc(
   exitForUninstall: () => Promise<void> = async () => app.exit(0),
 ): void {
   registerSiteBrowser(getMainWindow);
+  registerReaderLauncher(supervisor);
   let maintenanceBusy = false;
   let relocationSelection: {
     authorization: string;

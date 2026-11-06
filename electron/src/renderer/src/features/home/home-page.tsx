@@ -18,6 +18,7 @@ import type { DubProject } from '@/features/projects/project-format';
 import { Link, useNavigate } from '@tanstack/react-router';
 import { useQuery } from '@tanstack/react-query';
 import { apiJson } from '@/lib/api/client';
+import { openPdfReader } from '@/lib/pdf-reader';
 import {
   readDraft,
   replaceRecipe,
@@ -37,6 +38,8 @@ interface Destination {
   to: string;
   label: string;
   description: string;
+  /** Run an action instead of navigating (the card renders as a button). */
+  onActivate?: () => void;
 }
 
 interface ExportRecord {
@@ -56,6 +59,8 @@ const iconTones: Record<string, string> = {
   '/stories':
     'bg-rose-100 text-rose-700 ring-rose-300/60 dark:bg-rose-400/15 dark:text-rose-300 dark:ring-rose-300/30',
   '/audiobook':
+    'bg-amber-100 text-amber-800 ring-amber-300/60 dark:bg-amber-400/15 dark:text-amber-200 dark:ring-amber-300/30',
+  '/pdf-reader':
     'bg-amber-100 text-amber-800 ring-amber-300/60 dark:bg-amber-400/15 dark:text-amber-200 dark:ring-amber-300/30',
   '/gallery':
     'bg-fuchsia-100 text-fuchsia-700 ring-fuchsia-300/60 dark:bg-fuchsia-400/15 dark:text-fuchsia-300 dark:ring-fuchsia-300/30',
@@ -109,6 +114,14 @@ export function HomePage() {
       to: '/audiobook',
       label: t('audiobook.title'),
       description: t('homeUi.audiobook'),
+    },
+    {
+      // Opens the PDF Voice Reader in the default browser instead of routing.
+      // Keyed '/pdf-reader' (not a real route) to reuse the book icon/tone.
+      to: '/pdf-reader',
+      label: t('pdfReader.title'),
+      description: t('pdfReader.description'),
+      onActivate: () => void openPdfReader(),
     },
     {
       to: '/gallery',
@@ -254,13 +267,10 @@ export function HomePage() {
                 key={groupIndex}
                 className={`home-destinations grid grid-cols-1 gap-3 @xl:grid-cols-2 @3xl:grid-cols-3 @xl:[&>:last-child:nth-child(odd)]:col-span-2 @3xl:[&>:last-child:nth-child(odd)]:col-span-1 ${groupIndex === 0 ? 'home-destinations--primary' : 'home-destinations--secondary'}`}
               >
-                {group.map(({ to, label, description }) => (
-                  <Link
-                    key={to}
-                    to={to}
-                    data-destination={to}
-                    className={`home-destination group ${groupIndex === 0 ? 'home-destination--primary' : 'home-destination--secondary'}`}
-                  >
+                {group.map(({ to, label, description, onActivate }) => {
+                  const cardClass = `home-destination group ${groupIndex === 0 ? 'home-destination--primary' : 'home-destination--secondary'}`;
+                  const card = (
+                  <>
                     <div
                       className={`home-destination-icon flex size-10 items-center justify-center rounded-xl ring-1 ring-inset shadow-[inset_0_1px_0_rgb(255_255_255/10%)] ${iconTones[to]}`}
                     >
@@ -295,8 +305,24 @@ export function HomePage() {
                       <p>{description}</p>
                     </div>
                     <ArrowRightIcon className="home-destination-arrow" aria-hidden="true" />
-                  </Link>
-                ))}
+                  </>
+                  );
+                  return onActivate ? (
+                    <button
+                      key={to}
+                      type="button"
+                      data-destination="pdf-reader"
+                      onClick={onActivate}
+                      className={`${cardClass} text-left`}
+                    >
+                      {card}
+                    </button>
+                  ) : (
+                    <Link key={to} to={to} data-destination={to} className={cardClass}>
+                      {card}
+                    </Link>
+                  );
+                })}
               </div>
             ))}
           </section>

@@ -35,6 +35,8 @@ import {
   validateScript,
 } from '@shared/utils/audiobookScript';
 import { BookSettings } from './book-settings';
+import { PdfBatchPanel } from './pdf-batch-panel';
+import { EbookTranslatePanel } from './ebook-translate-panel';
 import { duplicateWords } from './book-options';
 import { useMemo, useRef, useState } from 'react';
 import { Link } from '@tanstack/react-router';
@@ -428,6 +430,22 @@ export function LongformPage({ mode }: { mode: Mode }) {
                 </Button>
               )}
             </div>
+            {mode === 'audiobook' && (
+              <PdfBatchPanel
+                disabled={locked}
+                renderOptions={{
+                  default_voice: draft.voice,
+                  language: draft.language,
+                  format: draft.format,
+                  loudness: draft.loudness,
+                  cover_path: draft.cover?.path ?? null,
+                  metadata: { ...draft.metadata, title: draft.title },
+                }}
+              />
+            )}
+            {mode === 'audiobook' && (
+              <EbookTranslatePanel disabled={locked} projectId={session.projectId} text={draft.script} />
+            )}
             {mode === 'audiobook' ? (
               <div className="flex min-h-64 flex-1 flex-col gap-3">
                 <AudiobookMarkupToolbar

@@ -481,6 +481,71 @@ def _embed_chunk(generator, audio, sample_rate, message):
     return audio + delta[..., :audio.shape[-1]]
 
 
+def _group_chunks(chunks, batch_size: int):
+    """Group an iterator of chunks into lists of <= batch_size, in order.
+
+    batch_size=1 yields one singleton list per chunk — the exact same
+    traversal order as the pre-batching code, just reshaped as groups of 1,
+    so the default path below never behaves differently from before batching
+    existed.
+    """
+    if batch_size < 1:
+        raise ValueError("batch_size must be >= 1")
+    group: list = []
+    for chunk in chunks:
+        group.append(chunk)
+        if len(group) == batch_size:
+            yield group
+            group = []
+    if group:
+        yield group
+
+
+def _embed_chunk_batch(generator, chunks, sample_rate, msg):
+    """Watermark N independent chunks in ONE generator forward call.
+
+    Each chunk keeps IDENTICAL per-chunk resample -> embed -> resample-residual
+    -> add math to ``_embed_chunk``; only the generator() call itself is
+    shared across the group. Chunks need not be the same length (the
+    tail-folded final chunk from ``_iter_chunks`` usually isn't): AudioSeal's
+    own length-trim uses ONE scalar for the whole batch
+    (``audioseal.models.AudioSealWM.get_watermark``: ``length = x.size(-1)``),
+    so shorter rows are padded before the call and every row is cropped back
+    to its OWN true length after — never relying on the model's batch-wide
+    trim, which would otherwise bleed the longest row's length into every
+    other row's output.
+    """
+    model_chunks = [_audioseal_resample(c, sample_rate, _AUDIOSEAL_SAMPLE_RATE) for c in chunks]
+    lengths = [mc.shape[-1] for mc in model_chunks]
+    max_len = max(lengths)
+    padded = [
+        torch.nn.functional.pad(mc, (0, max_len - n)) if n < max_len else mc
+        for mc, n in zip(model_chunks, lengths)
+    ]
+    batched_model_audio = torch.cat(padded, dim=0)  # (K, channels, max_len)
+    # AudioSealWM only auto-broadcasts a 1-D message (models.py:
+    # `elif message.ndim == 1: message = message.unsqueeze(0).repeat(x.shape[0], 1)`);
+    # ours is already (1, 16) (ndim==2), so it must be repeated to the batch's
+    # row count explicitly or it would mismatch the batched input.
+    batched_msg = msg.repeat(batched_model_audio.shape[0], 1)
+    marked_batched = generator(
+        batched_model_audio, sample_rate=_AUDIOSEAL_SAMPLE_RATE, message=batched_msg
+    )
+
+    outputs = []
+    for i, (chunk, model_chunk, model_len) in enumerate(zip(chunks, model_chunks, lengths)):
+        marked = marked_batched[i : i + 1, ..., :model_len]
+        if sample_rate == _AUDIOSEAL_SAMPLE_RATE:
+            outputs.append(marked)
+            continue
+        delta = _audioseal_resample(marked - model_chunk, _AUDIOSEAL_SAMPLE_RATE, sample_rate)
+        missing = chunk.shape[-1] - delta.shape[-1]
+        if missing > 0:
+            delta = torch.nn.functional.pad(delta, (0, missing))
+        outputs.append(chunk + delta[..., : chunk.shape[-1]])
+    return outputs
+
+
 @torch.no_grad()
 def embed_watermark(
     waveform: torch.Tensor,
@@ -488,6 +553,7 @@ def embed_watermark(
     message: Optional[list[int]] = None,
     *,
     force: bool = False,
+    batch_size: int = 1,
 ) -> torch.Tensor:
     """
     Embed an imperceptible watermark into the audio waveform.
@@ -502,6 +568,15 @@ def embed_watermark(
             It does NOT bypass availability: when AudioSeal isn't installed the
             call still no-ops and returns the input unchanged. Existing
             positional call sites default to ``force=False`` (unchanged).
+        batch_size: Keyword-only, default ``1`` — the exact pre-batching
+            behavior (one generator call per ~30 s chunk from
+            ``_iter_chunks``). A value >1 groups that many consecutive chunks
+            into one forward call to amortize per-call overhead on long audio
+            (audiobook chapters). No existing caller passes this; it is
+            strictly opt-in, so every call site is unaffected until it asks
+            for it explicitly. A group that fails to batch falls back to
+            sequential embedding for that group only — never for the whole
+            waveform.
 
     Returns:
         Watermarked waveform (same shape as input).
@@ -524,15 +599,33 @@ def embed_watermark(
 
         # AudioSeal 0.2 ignores sample_rate: normalize each bounded chunk
         # explicitly, then add only the resampled watermark to the source.
+        # batch_size==1 (the default) takes the `len(group) == 1` branch for
+        # every chunk — byte-for-byte the same call sequence as before
+        # batching existed. A group only reaches _embed_chunk_batch when a
+        # caller explicitly opts into batch_size > 1.
         def _embed(host: torch.Tensor) -> torch.Tensor:
             with _eager_audioseal():
-                return torch.cat(
-                    [
-                        _embed_chunk(generator, seg, sample_rate, msg)
-                        for seg in _iter_chunks(host, sample_rate)
-                    ],
-                    dim=-1,
-                )
+                results: list[torch.Tensor] = []
+                for group in _group_chunks(_iter_chunks(host, sample_rate), batch_size):
+                    if len(group) == 1:
+                        results.append(_embed_chunk(generator, group[0], sample_rate, msg))
+                        continue
+                    try:
+                        results.extend(_embed_chunk_batch(generator, group, sample_rate, msg))
+                    except Exception:
+                        # Never let a batching-specific failure cost the
+                        # watermark outright: fall back to the proven
+                        # per-chunk path for just this group and keep going.
+                        logger.warning(
+                            "Batched watermark embed (batch_size=%d) failed for "
+                            "a group of %d chunks; falling back to sequential "
+                            "embedding for this group",
+                            batch_size, len(group), exc_info=True,
+                        )
+                        results.extend(
+                            _embed_chunk(generator, seg, sample_rate, msg) for seg in group
+                        )
+                return torch.cat(results, dim=-1)
 
         watermarked = _embed(audio)
         # Every exit (PCM16 stream frames, WAV, MP3) is fixed-point, so any

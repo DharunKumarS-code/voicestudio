@@ -5,6 +5,7 @@ import {
   AudioLinesIcon,
   FingerprintIcon,
   BookOpenIcon,
+  BookHeadphonesIcon,
   FolderIcon,
   WrenchIcon,
   LayersIcon,
@@ -20,6 +21,7 @@ import {
 import { useTranslation } from 'react-i18next';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { setWorkspace } from '@/lib/store/workspace';
+import { openPdfReader } from '@/lib/pdf-reader';
 import { cn } from '@/lib/utils';
 import './workspace-menu.css';
 
@@ -51,6 +53,11 @@ const voiceDestinations: Destination[] = [
   ['/personas', 'nav.saved', UsersRoundIcon, openSaved],
   ['/gallery', 'nav.gallery', LibraryIcon],
 ];
+// Restored alongside the PDF Voice Reader launcher below: the two are
+// separate features (New Audiobook creates a multi-voice cast/export
+// project; PDF Voice Reader reads a PDF aloud in the browser). Existing
+// Audiobook projects were always reachable via Continue Project even while
+// this entry was removed — see PdfReaderLaunchItem for the launcher.
 const storyDestinations: Destination[] = [
   ['/stories', 'nav.stories', AudioLinesIcon],
   ['/audiobook', 'audiobook.title', BookOpenIcon],
@@ -144,18 +151,77 @@ function NavigationLink({
   );
 }
 
+/**
+ * PDF Voice Reader: not a route. It asks main to make sure the backend is up and
+ * opens the reader in the default browser. Styled exactly like a NavigationLink.
+ */
+function PdfReaderLaunchItem({
+  compact = false,
+  nested = false,
+  flyout = false,
+  onLaunch,
+}: {
+  compact?: boolean;
+  nested?: boolean;
+  flyout?: boolean;
+  onLaunch?: () => void;
+}) {
+  const { t } = useTranslation();
+  const label = t('pdfReader.title');
+  const button = (
+    <button
+      type="button"
+      data-slot="pdf-reader-launch"
+      aria-label={compact ? label : undefined}
+      onClick={() => {
+        onLaunch?.();
+        void openPdfReader();
+      }}
+      className={cn(
+        itemClass,
+        'w-full text-left',
+        compact
+          ? 'h-10 justify-center px-0'
+          : flyout
+            ? 'h-10 gap-2 px-3 text-sm'
+            : nested
+              ? 'gap-2 px-2'
+              : 'gap-2.5 px-2.5',
+      )}
+    >
+      <BookHeadphonesIcon
+        className={iconClass}
+        data-tone="audiobook"
+        data-motion="tilt"
+        aria-hidden="true"
+      />
+      {!compact && <span className="truncate">{label}</span>}
+    </button>
+  );
+  if (!compact) return button;
+  return (
+    <Tooltip>
+      <TooltipTrigger render={button} />
+      <TooltipContent side="right">{label}</TooltipContent>
+    </Tooltip>
+  );
+}
+
 function NavigationGroup({
   label,
   icon: Icon,
   children,
   compact,
   pathname,
+  withPdfReader = false,
 }: {
   label: string;
   icon: typeof AudioLinesIcon;
   children: Destination[];
   compact: boolean;
   pathname: string;
+  /** Append the PDF Voice Reader launcher after the group's links. */
+  withPdfReader?: boolean;
 }) {
   const { t } = useTranslation();
   const active = children.some(([to]) => pathname === to || pathname.startsWith(to + '/'));
@@ -281,6 +347,7 @@ function NavigationGroup({
                 onCurrentRoute={pathname === destination[0] ? () => setPopupOpen(false) : undefined}
               />
             ))}
+            {withPdfReader && <PdfReaderLaunchItem flyout onLaunch={() => setPopupOpen(false)} />}
           </div>
         </PopoverContent>
       </Popover>
@@ -324,6 +391,7 @@ function NavigationGroup({
             {children.map((destination) => (
               <NavigationLink key={destination[0]} destination={destination} nested />
             ))}
+            {withPdfReader && <PdfReaderLaunchItem nested />}
           </div>
         </div>
       </div>
@@ -358,6 +426,7 @@ export function WorkspaceNavigation({ compact = false }: { compact?: boolean }) 
         children={storyDestinations}
         compact={compact}
         pathname={pathname}
+        withPdfReader
       />
       <NavigationGroup
         label="nav.dub"
