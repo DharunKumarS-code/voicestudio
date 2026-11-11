@@ -162,7 +162,7 @@ jobs:
       # enable-cache persists ~/.cache/uv across runs, keyed on uv.lock —
       # turns `uv sync` from ~45 s cold to ~5 s warm.
       - name: Install uv
-        uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3.2.4
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -637,7 +637,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3.2.4
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
