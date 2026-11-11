@@ -444,7 +444,7 @@ export function LongformPage({ mode }: { mode: Mode }) {
               />
             )}
             {mode === 'audiobook' && (
-              <EbookTranslatePanel disabled={locked} projectId={session.projectId} text={draft.script} />
+              <EbookTranslatePanel disabled={locked} projectId={draft.projectId} text={draft.script} />
             )}
             {mode === 'audiobook' ? (
               <div className="flex min-h-64 flex-1 flex-col gap-3">

@@ -124,7 +124,17 @@ export function EbookTranslatePanel({
         </label>
         <label className="flex flex-col gap-1 text-xs text-muted-foreground">
           {t('audiobook.ebook_translate.provider_label')}
-          <Select value={provider} onValueChange={setProvider} disabled={disabled || busy}>
+          <Select
+            items={(engineData?.engines ?? []).map((engine) => ({
+              value: engine.id,
+              label: engine.display_name,
+            }))}
+            value={provider}
+            onValueChange={(value) => {
+              if (value !== null) setProvider(value);
+            }}
+            disabled={disabled || busy}
+          >
             <SelectTrigger className="h-7 w-44" aria-label={t('audiobook.ebook_translate.provider_label')}>
               <SelectValue />
             </SelectTrigger>
